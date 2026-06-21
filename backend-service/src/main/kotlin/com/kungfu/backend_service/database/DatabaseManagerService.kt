@@ -40,7 +40,7 @@ class DatabaseManagerService(
         ensureTableExists(normalizedTable)
         val primaryKeyColumn = findPrimaryKeyColumn(normalizedTable)
 
-        return jdbcTemplate.query(
+        val columns = jdbcTemplate.query(
             """
             SELECT column_name, is_nullable, data_type, is_identity, column_default
             FROM information_schema.columns
@@ -64,6 +64,18 @@ class DatabaseManagerService(
             },
             normalizedTable,
         )
+
+        return when (normalizedTable) {
+            "instructores" -> columns.sortedBy { if (it.name == "nombre") 0 else 1 }
+            "alumnos" -> {
+                val preferredOrder = listOf("nombre", "fecha_nacimiento", "id_grado", "correo_electronico")
+                columns.sortedBy { column ->
+                    val preferredIndex = preferredOrder.indexOf(column.name)
+                    if (preferredIndex >= 0) preferredIndex else preferredOrder.size + 1
+                }
+            }
+            else -> columns
+        }
     }
 
     fun listRows(tableName: String, limit: Int): List<Map<String, Any?>> {
