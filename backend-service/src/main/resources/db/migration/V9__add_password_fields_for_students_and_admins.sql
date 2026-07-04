@@ -1,0 +1,5 @@
+ALTER TABLE alumnos
+ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255);
+
+ALTER TABLE administradores
+ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255);
