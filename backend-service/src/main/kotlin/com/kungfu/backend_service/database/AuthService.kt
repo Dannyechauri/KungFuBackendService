@@ -24,6 +24,7 @@ class AuthService(
         val candidates = mutableListOf<AuthCandidate>()
         findAdminByEmail(email)?.let { candidates.add(it) }
         findStudentByEmail(email)?.let { candidates.add(it) }
+        findInstructorByEmail(email)?.let { candidates.add(it) }
 
         if (candidates.isEmpty()) {
             throw ResponseStatusException(HttpStatus.UNAUTHORIZED, "Credenciales inválidas")
@@ -73,6 +74,27 @@ class AuthService(
                     role = Roles.USER,
                     userId = rs.getLong("id_alumno"),
                     displayName = rs.getString("nombre_mostrado") ?: "Alumno",
+                    passwordHash = rs.getString("password_hash"),
+                )
+            },
+            email,
+        ).firstOrNull()
+    }
+
+    private fun findInstructorByEmail(email: String): AuthCandidate? {
+        return jdbcTemplate.query(
+            """
+            SELECT id_instructor, COALESCE(nombre, 'Instructor') AS nombre_mostrado, password_hash
+            FROM instructores
+            WHERE LOWER(correo_electronico) = LOWER(?)
+              AND (activo IS NULL OR activo = TRUE)
+            LIMIT 1
+            """.trimIndent(),
+            { rs, _ ->
+                AuthCandidate(
+                    role = Roles.USER,
+                    userId = rs.getLong("id_instructor"),
+                    displayName = rs.getString("nombre_mostrado") ?: "Instructor",
                     passwordHash = rs.getString("password_hash"),
                 )
             },

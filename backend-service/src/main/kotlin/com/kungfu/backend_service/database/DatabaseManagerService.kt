@@ -17,7 +17,7 @@ class DatabaseManagerService(
     private val identifierRegex = Regex("^[a-zA-Z_][a-zA-Z0-9_]*$")
     private val passwordEncoder: PasswordEncoder = BCryptPasswordEncoder()
     private val bcryptHashRegex = Regex("^\\$2[aby]\\$\\d{2}\\$.{53}$")
-    private val passwordManagedTables = setOf("alumnos", "administradores")
+    private val passwordManagedTables = setOf("alumnos", "administradores", "instructores")
 
     fun health(): DatabaseHealth {
         val databaseTime = jdbcTemplate.queryForObject("SELECT NOW()", String::class.java)
@@ -115,6 +115,7 @@ class DatabaseManagerService(
             .toSortedMap()
 
         require(insertData.isNotEmpty()) { "No hay columnas válidas para insertar." }
+        validateInstructorCredentialsForStandalone(normalizedTable, insertData)
 
         val quotedTable = quoteIdentifier(normalizedTable)
         val quotedColumns = insertData.keys.joinToString(", ") { quoteIdentifier(it) }
@@ -148,6 +149,13 @@ class DatabaseManagerService(
             .toSortedMap()
 
         require(updateData.isNotEmpty()) { "No hay columnas válidas para actualizar." }
+
+        if (normalizedTable == "instructores") {
+            val currentRow = fetchRowByPrimaryKey(normalizedTable, primaryKeyColumns, primaryKeyValues)
+            val mergedRow = currentRow.toMutableMap()
+            mergedRow.putAll(updateData)
+            validateInstructorCredentialsForStandalone(normalizedTable, mergedRow)
+        }
 
         val quotedTable = quoteIdentifier(normalizedTable)
         val setClause = updateData.keys.joinToString(", ") { "${quoteIdentifier(it)} = ?" }
@@ -215,6 +223,60 @@ class DatabaseManagerService(
 
     private fun shouldHashPassword(tableName: String, columnName: String): Boolean {
         return columnName == "password_hash" && tableName in passwordManagedTables
+    }
+
+    private fun validateInstructorCredentialsForStandalone(tableName: String, rowData: Map<String, Any?>) {
+        if (tableName != "instructores") {
+            return
+        }
+
+        val password = rowData["password_hash"]?.toString()?.trim().orEmpty()
+        val email = rowData["correo_electronico"]?.toString()?.trim().orEmpty()
+        val instructorId = rowData["id_instructor"]?.toString()?.trim().orEmpty()
+
+        val linkedById = instructorId.toLongOrNull()?.let { studentId ->
+            jdbcTemplate.queryForObject(
+                "SELECT EXISTS (SELECT 1 FROM alumnos WHERE id_alumno = ?)",
+                Boolean::class.java,
+                studentId,
+            ) ?: false
+        } ?: false
+
+        val linkedByEmail = if (email.isNotBlank()) {
+            jdbcTemplate.queryForObject(
+                "SELECT EXISTS (SELECT 1 FROM alumnos WHERE LOWER(correo_electronico) = LOWER(?))",
+                Boolean::class.java,
+                email,
+            ) ?: false
+        } else {
+            false
+        }
+
+        val isStandaloneInstructor = !linkedById && !linkedByEmail
+        if (!isStandaloneInstructor) {
+            return
+        }
+
+        require(email.isNotBlank()) {
+            "El instructor que no es alumno debe tener correo_electronico para iniciar sesión."
+        }
+
+        require(password.isNotBlank()) {
+            "El instructor que no es alumno debe tener contraseña."
+        }
+    }
+
+    private fun fetchRowByPrimaryKey(
+        tableName: String,
+        primaryKeyColumns: List<String>,
+        primaryKeyValues: List<String>,
+    ): Map<String, Any?> {
+        val quotedTable = quoteIdentifier(tableName)
+        val whereClause = primaryKeyColumns.joinToString(" AND ") { "${quoteIdentifier(it)}::text = ?" }
+        val sql = "SELECT * FROM $quotedTable WHERE $whereClause LIMIT 1"
+
+        return jdbcTemplate.queryForList(sql, *primaryKeyValues.toTypedArray()).firstOrNull()
+            ?: throw IllegalArgumentException("No se encontró el registro a actualizar en '$tableName'.")
     }
 
     private fun coerceNumber(value: Any, converter: (Double) -> Any): Any {
