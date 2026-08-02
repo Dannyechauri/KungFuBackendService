@@ -20,6 +20,8 @@ class DatabaseManagerController(
 ) {
     private val blockedUserReadTables = setOf("administradores", "flyway_schema_history")
     private val blockedAllMutationTables = setOf("flyway_schema_history")
+    // Tablas donde cualquier usuario autenticado puede gestionar sus propias filas
+    private val selfServiceTables = setOf("asistencias_curso")
 
     @GetMapping("/health")
     fun health(): DatabaseHealth {
@@ -63,7 +65,10 @@ class DatabaseManagerController(
         @RequestBody payload: Map<String, Any?>,
         session: HttpSession,
     ): Map<String, Any?> {
-        requireAdmin(session)
+        val user = requireAuthenticated(session)
+        if (tableName !in selfServiceTables && user.role != Roles.ADMIN) {
+            throw ResponseStatusException(HttpStatus.FORBIDDEN, "Permiso de administrador requerido")
+        }
         requireTableMutationAllowed(tableName)
         return databaseManagerService.insertRow(tableName, payload)
     }
@@ -94,7 +99,10 @@ class DatabaseManagerController(
         @PathVariable id: String,
         session: HttpSession,
     ): DeleteResult {
-        requireAdmin(session)
+        val user = requireAuthenticated(session)
+        if (tableName !in selfServiceTables && user.role != Roles.ADMIN) {
+            throw ResponseStatusException(HttpStatus.FORBIDDEN, "Permiso de administrador requerido")
+        }
         requireTableMutationAllowed(tableName)
         val deleted = databaseManagerService.deleteRowByPrimaryKey(tableName, id)
         return DeleteResult(deleted = deleted)
