@@ -36,7 +36,13 @@ const eventInput = z.object({
   endAt: localDateTime,
 }).strict()
 
-const eventPatch = eventInput.partial().strict().refine((value) => Object.keys(value).length > 0)
+const eventPatch = z.object({
+  courseId: identifier.optional(),
+  instructorId: identifier.optional(),
+  roomId: identifier.nullable().optional(),
+  startAt: localDateTime.optional(),
+  endAt: localDateTime.optional(),
+}).strict().refine((value) => Object.keys(value).length > 0)
 const courseInput = z.object({
   nombre: z.string().trim().min(1).max(100),
   tema: z.string().trim().min(1).max(120),
@@ -59,7 +65,7 @@ const recurrenceInput = z.object({
 const recurrencePatch = z.object({
   courseId: identifier.optional(),
   instructorId: identifier.optional(),
-  roomId: identifier.optional(),
+  roomId: identifier.nullable().optional(),
   weekdays: z.array(z.number().int().min(1).max(7)).min(1).max(1).optional(),
   startTime: localTime.optional(),
   endTime: localTime.optional(),

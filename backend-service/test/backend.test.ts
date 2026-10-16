@@ -18,7 +18,7 @@ const localHosts = new Set(['localhost', '127.0.0.1', '::1'])
 let adminUrl!: URL
 let pool!: ReturnType<typeof createPool>
 let app!: Awaited<ReturnType<typeof createApp>>
-let ids: { admin: number; instructor: number; student: number; habitualCourse: number; specialCourse: number; secondInstructor: number; primaryRoom: number; secondRoom: number }
+let ids: { admin: number; instructor: number; student: number; habitualCourse: number; specialCourse: number; secondInstructor: number; primaryRoom: number; secondRoom: number; style: number }
 
 function quoteDatabaseName(name: string) {
   if (!/^kungfu_node_test_\d+_[a-f0-9]+$/u.test(name)) throw new Error('Refusing to touch a database outside the backend test naming scheme.')
@@ -78,6 +78,11 @@ async function seedAccountsAndCourses() {
   const secondRoom = await pool.query<{ id_sala: number }>(`
     INSERT INTO salas (nombre) VALUES ('Sala Tatami') RETURNING id_sala
   `)
+  const style = await pool.query<{ id_estilo: number }>(`
+    INSERT INTO estilos (nombre, descripcion)
+    VALUES ('Estilo test', 'Estilo para validar claves foráneas')
+    RETURNING id_estilo
+  `)
   const student = await pool.query<{ id_alumno: number }>(`
     INSERT INTO alumnos (numero_matricula, fecha_ingreso, activo, fecha_nacimiento, id_grado, correo_electronico, password_hash, nombre)
     VALUES ('TEST-001', CURRENT_DATE, TRUE, DATE '2000-01-01', $1, 'student@test.invalid', $2, 'Alumno test')
@@ -103,6 +108,7 @@ async function seedAccountsAndCourses() {
     specialCourse: Number(special.rows[0]!.id_curso),
     primaryRoom: Number(primaryRoom.rows[0]!.id_sala),
     secondRoom: Number(secondRoom.rows[0]!.id_sala),
+    style: Number(style.rows[0]!.id_estilo),
   }
 }
 
@@ -183,12 +189,20 @@ describe('auth and backwards-compatible database API', () => {
     const tables = await app.inject({ url: '/api/database/tables', headers: authHeaders(cookie) })
     expect(tables.statusCode).toBe(200)
     expect(tables.json()).toContain('cursos')
+    expect(tables.json()).toContain('salas')
+    expect(tables.json()).toContain('horarios_recurrentes')
     expect(tables.json()).not.toContain('node_schema_history')
 
     const metadata = await app.inject({ url: '/api/database/tables/cursos/columns', headers: authHeaders(cookie) })
     expect(metadata.statusCode).toBe(200)
     expect(metadata.json()).toEqual(expect.arrayContaining([
       expect.objectContaining({ name: 'tipo_curso' }),
+    ]))
+
+    const scheduleMetadata = await app.inject({ url: '/api/database/tables/cursos_agendados/columns', headers: authHeaders(cookie) })
+    expect(scheduleMetadata.json()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'id_curso', foreignKey: { tableName: 'cursos', columnName: 'id_curso' } }),
+      expect.objectContaining({ name: 'id_sala', foreignKey: { tableName: 'salas', columnName: 'id_sala' } }),
     ]))
 
     const inserted = await app.inject({
@@ -215,6 +229,57 @@ describe('auth and backwards-compatible database API', () => {
     })
     expect(deleted.statusCode).toBe(200)
     expect(deleted.json()).toEqual({ deleted: true })
+
+    const composite = await app.inject({
+      method: 'POST',
+      url: '/api/database/tables/instructor_estilo/rows',
+      headers: authHeaders(cookie),
+      payload: { id_instructor: ids.instructor, id_estilo: ids.style },
+    })
+    expect(composite.statusCode).toBe(200)
+    expect(Number(composite.json().id_instructor)).toBe(ids.instructor)
+    const compositeDelete = await app.inject({
+      method: 'DELETE',
+      url: `/api/database/tables/instructor_estilo/rows/${ids.instructor},${ids.style}`,
+      headers: authHeaders(cookie),
+    })
+    expect(compositeDelete.statusCode).toBe(200)
+    expect(compositeDelete.json()).toEqual({ deleted: true })
+
+    const genericRule = await app.inject({
+      method: 'POST',
+      url: '/api/database/tables/horarios_recurrentes/rows',
+      headers: authHeaders(cookie),
+      payload: {
+        id_curso: ids.habitualCourse,
+        id_instructor: ids.instructor,
+        id_sala: ids.primaryRoom,
+        dia_semana: 2,
+        hora_inicio: '12:00',
+        hora_fin: '13:00',
+        fecha_inicio: '2092-12-01',
+      },
+    })
+    expect(genericRule.statusCode).toBe(200)
+    expect(Number(genericRule.json().id_sala)).toBe(ids.primaryRoom)
+    const genericRuleId = genericRule.json().id_horario_recurrente
+    const updatedRule = await app.inject({
+      method: 'PUT',
+      url: `/api/database/tables/horarios_recurrentes/rows/${genericRuleId}`,
+      headers: authHeaders(cookie),
+      payload: { hora_inicio: '13:30', hora_fin: '14:30' },
+    })
+    expect(updatedRule.statusCode).toBe(200)
+    expect(updatedRule.json().hora_inicio).toMatch(/^13:30/u)
+    const cancelledRule = await app.inject({
+      method: 'DELETE',
+      url: `/api/database/tables/horarios_recurrentes/rows/${genericRuleId}`,
+      headers: authHeaders(cookie),
+    })
+    expect(cancelledRule.statusCode).toBe(200)
+    expect(cancelledRule.json()).toEqual({ deleted: true })
+    const persistedRule = await pool.query('SELECT activo FROM horarios_recurrentes WHERE id_horario_recurrente = $1', [genericRuleId])
+    expect(persistedRule.rows[0].activo).toBe(false)
 
     const special = await app.inject({
       method: 'POST',

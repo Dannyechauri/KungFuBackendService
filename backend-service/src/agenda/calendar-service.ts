@@ -29,7 +29,7 @@ export type RecurrenceInput = {
 export type CalendarEventPatch = {
   courseId?: number | undefined
   instructorId?: number | undefined
-  roomId?: number | undefined
+  roomId?: number | null | undefined
   startAt?: string | undefined
   endAt?: string | undefined
 }
@@ -37,7 +37,7 @@ export type CalendarEventPatch = {
 export type RecurrencePatch = {
   courseId?: number | undefined
   instructorId?: number | undefined
-  roomId?: number | undefined
+  roomId?: number | null | undefined
   weekdays?: number[] | undefined
   startTime?: string | undefined
   endTime?: string | undefined
@@ -443,7 +443,7 @@ export async function updateCalendarEvent(pool: Pool, id: number, input: Calenda
     const courseId = input.courseId ?? Number(old.id_curso)
     const instructorId = input.instructorId ?? Number(old.id_instructor)
     const oldRoomId = old.id_sala === null ? null : Number(old.id_sala)
-    const roomId = input.roomId ?? oldRoomId
+    const roomId = input.roomId === undefined ? oldRoomId : input.roomId
     const startAt = input.startAt ?? old.fecha_hora
     const endAt = input.endAt ?? old.fecha_hora_fin
     const interval = validateEventInterval(startAt, endAt)
@@ -530,7 +530,7 @@ export async function updateRecurringRule(pool: Pool, id: number, input: Recurre
     const courseId = input.courseId ?? Number(old.id_curso)
     const instructorId = input.instructorId ?? Number(old.id_instructor)
     const oldRoomId = old.id_sala === null ? null : Number(old.id_sala)
-    const roomId = input.roomId ?? oldRoomId
+    const roomId = input.roomId === undefined ? oldRoomId : input.roomId
     const weekday = input.weekdays?.[0] ?? Number(old.dia_semana)
     const startTime = normalizeTime(input.startTime ?? old.hora_inicio)
     const endTime = normalizeTime(input.endTime ?? old.hora_fin)
