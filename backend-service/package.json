@@ -11,7 +11,8 @@
     "test:watch": "vitest",
     "lint": "oxlint src test",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json",
-    "db:migrate": "node --env-file-if-exists=.env.local --import tsx src/cli/migrate.ts"
+    "db:migrate": "node --env-file-if-exists=.env.local --import tsx src/cli/migrate.ts",
+    "admin:create": "node --env-file-if-exists=.env.local --import tsx src/cli/create-admin.ts"
   },
   "engines": {
     "node": ">=24.21.0 <25",

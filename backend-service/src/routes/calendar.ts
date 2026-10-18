@@ -2,7 +2,7 @@ import type { FastifyPluginAsync } from 'fastify'
 import type { Pool } from 'pg'
 import { z } from 'zod'
 
-import { mayManageSchedule, requireUser } from '../domain/auth.js'
+import { mayManageSchedule, requireRole, requireUser, Roles } from '../domain/auth.js'
 import { ApiError } from '../errors.js'
 import {
   cancelCalendarEvent,
@@ -91,6 +91,16 @@ function parseId(value: string) {
 }
 
 export const calendarRoutes: FastifyPluginAsync<CalendarRoutesOptions> = async (app, { pool }) => {
+  app.get('/instructors', async (request) => {
+    requireRole(request, [Roles.ADMIN, Roles.INSTRUCTOR])
+    const result = await pool.query<{ id_instructor: number; nombre: string; activo: boolean | null }>(`
+      SELECT id_instructor, nombre, activo
+      FROM instructores
+      ORDER BY nombre, id_instructor
+    `)
+    return result.rows
+  })
+
   app.get('/rooms', async (request) => {
     requireUser(request)
     return listCalendarRooms(pool)
@@ -98,14 +108,14 @@ export const calendarRoutes: FastifyPluginAsync<CalendarRoutesOptions> = async (
 
   app.post<{ Body: unknown }>('/rooms', async (request, reply) => {
     const user = requireUser(request)
-    if (user.role !== 'ADMIN') throw new ApiError(403, 'Solo administradores pueden gestionar las salas.')
+    if (!mayManageSchedule(user.role)) throw new ApiError(403, 'Solo el equipo docente puede gestionar las salas.')
     const room = await createCalendarRoom(pool, parseBody(roomInput, request.body))
     return reply.code(201).send(room)
   })
 
   app.patch<{ Params: { id: string }; Body: unknown }>('/rooms/:id', async (request) => {
     const user = requireUser(request)
-    if (user.role !== 'ADMIN') throw new ApiError(403, 'Solo administradores pueden gestionar las salas.')
+    if (!mayManageSchedule(user.role)) throw new ApiError(403, 'Solo el equipo docente puede gestionar las salas.')
     return updateCalendarRoom(pool, parseId(request.params.id), parseBody(roomPatch, request.body))
   })
 

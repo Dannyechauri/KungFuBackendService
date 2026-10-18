@@ -36,3 +36,7 @@ export function requireRole(request: FastifyRequest, roles: readonly UserRole[])
 export function mayManageSchedule(role: UserRole) {
   return role === Roles.ADMIN || role === Roles.INSTRUCTOR
 }
+
+export function mayManageSchoolData(role: UserRole) {
+  return role === Roles.ADMIN
+}

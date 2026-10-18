@@ -183,6 +183,26 @@ describe('auth and backwards-compatible database API', () => {
     expect(student.response.json().role).toBe('USER')
   })
 
+  it('limits repeated login attempts per IP and account', async () => {
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/api/auth/login',
+        remoteAddress: '198.51.100.10',
+        payload: { email: 'limited@test.invalid', password: 'wrong-password' },
+      })
+      expect(response.statusCode).toBe(401)
+    }
+
+    const limited = await app.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      remoteAddress: '198.51.100.10',
+      payload: { email: 'limited@test.invalid', password: 'wrong-password' },
+    })
+    expect(limited.statusCode).toBe(429)
+  })
+
   it('limits unauthenticated access and retains table metadata/CRUD for admins', async () => {
     expect((await app.inject({ url: '/api/database/tables' })).statusCode).toBe(401)
     const { cookie } = await login('admin@test.invalid')
@@ -192,6 +212,7 @@ describe('auth and backwards-compatible database API', () => {
     expect(tables.json()).toContain('salas')
     expect(tables.json()).toContain('horarios_recurrentes')
     expect(tables.json()).not.toContain('node_schema_history')
+    expect((await app.inject({ method: 'POST', url: '/api/database/migrate', headers: authHeaders(cookie) })).statusCode).toBe(404)
 
     const metadata = await app.inject({ url: '/api/database/tables/cursos/columns', headers: authHeaders(cookie) })
     expect(metadata.statusCode).toBe(200)
@@ -306,6 +327,30 @@ describe('auth and backwards-compatible database API', () => {
     expect(Number(legacySchedule.json().id_sala)).toBe(ids.primaryRoom)
   })
 
+  it('keeps exactly one application administrator account', async () => {
+    const { cookie } = await login('admin@test.invalid')
+    const secondAdmin = await app.inject({
+      method: 'POST',
+      url: '/api/database/tables/administradores/rows',
+      headers: authHeaders(cookie),
+      payload: { nombre: 'Segundo admin', correo_electronico: 'admin2@test.invalid', password_hash: 'another-test-password' },
+    })
+    expect(secondAdmin.statusCode).toBe(409)
+
+    const deleteLastAdmin = await app.inject({
+      method: 'DELETE',
+      url: `/api/database/tables/administradores/rows/${ids.admin}`,
+      headers: authHeaders(cookie),
+    })
+    expect(deleteLastAdmin.statusCode).toBe(409)
+
+    const existingHash = await pool.query<{ password_hash: string }>('SELECT password_hash FROM administradores WHERE id_administrador = $1', [ids.admin])
+    await expect(pool.query(`
+      INSERT INTO administradores (nombre, fecha_inicio, correo_electronico, password_hash)
+      VALUES ('Segundo admin', CURRENT_DATE, 'admin2@test.invalid', $1)
+    `, [existingHash.rows[0]!.password_hash])).rejects.toMatchObject({ code: '23505' })
+  })
+
   it('blocks student writes to generic tables and their access to admin data', async () => {
     const { cookie } = await login('student@test.invalid')
     const admins = await app.inject({ url: '/api/database/tables/administradores/rows', headers: authHeaders(cookie) })
@@ -325,18 +370,22 @@ describe('auth and backwards-compatible database API', () => {
     })).statusCode).toBe(200)
   })
 
-  it('allows instructors to read management data but not student private administrative tables', async () => {
+  it('keeps generic school data admin-only and exposes only calendar-safe instructor details', async () => {
     const { cookie } = await login('instructor@test.invalid')
     const tables = await app.inject({ url: '/api/database/tables', headers: authHeaders(cookie) })
-    expect(tables.statusCode).toBe(200)
-    expect(tables.json()).toContain('cursos')
-    expect(tables.json()).not.toContain('administradores')
+    expect(tables.statusCode).toBe(403)
     const students = await app.inject({
       url: '/api/database/tables/alumnos/rows?limit=1',
       headers: authHeaders(cookie),
     })
-    expect(students.statusCode).toBe(200)
-    expect(students.json()[0]).not.toHaveProperty('password_hash')
+    expect(students.statusCode).toBe(403)
+    const instructors = await app.inject({ url: '/api/calendar/instructors', headers: authHeaders(cookie) })
+    expect(instructors.statusCode).toBe(200)
+    expect(instructors.json()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id_instructor: String(ids.instructor), nombre: 'Instructor test', activo: true }),
+    ]))
+    expect(instructors.json()[0]).not.toHaveProperty('correo_electronico')
+    expect(instructors.json()[0]).not.toHaveProperty('password_hash')
   })
 
   it('restricts self-service attendance rows to the authenticated student', async () => {
@@ -381,7 +430,7 @@ describe('auth and backwards-compatible database API', () => {
 })
 
 describe('agenda API', () => {
-  it('lists rooms for authenticated users and restricts room management to admins', async () => {
+  it('lets the teaching team manage rooms used by the calendar', async () => {
     expect((await app.inject({ url: '/api/calendar/rooms' })).statusCode).toBe(401)
 
     const { cookie: adminCookie } = await login('admin@test.invalid')
@@ -446,13 +495,21 @@ describe('agenda API', () => {
     expect(updated.json()).toMatchObject({ activo: false })
 
     const { cookie: instructorCookie } = await login('instructor@test.invalid')
-    const forbidden = await app.inject({
+    const instructorRoom = await app.inject({
       method: 'POST',
       url: '/api/calendar/rooms',
       headers: authHeaders(instructorCookie),
-      payload: { nombre: 'Sala no autorizada' },
+      payload: { nombre: 'Sala del instructor' },
     })
-    expect(forbidden.statusCode).toBe(403)
+    expect(instructorRoom.statusCode).toBe(201)
+    const renamedByInstructor = await app.inject({
+      method: 'PATCH',
+      url: `/api/calendar/rooms/${instructorRoom.json().id_sala}`,
+      headers: authHeaders(instructorCookie),
+      payload: { nombre: 'Sala compartida' },
+    })
+    expect(renamedByInstructor.statusCode).toBe(200)
+    expect(renamedByInstructor.json().nombre).toBe('Sala compartida')
   })
 
   it('lets instructors create and edit habitual/special course definitions', async () => {
@@ -710,7 +767,7 @@ describe('database migration runner', () => {
     if (!pool) throw new Error('Test database pool has not been initialized.')
     const result = await migrateDatabase(pool)
     expect(result.migrationsExecuted).toBe(0)
-    expect(result.appliedVersions).toContain(14)
+    expect(result.appliedVersions).toContain(15)
   })
 
   it('baselines an existing Flyway v12 database and preserves scheduled rows', async () => {
@@ -759,7 +816,7 @@ describe('database migration runner', () => {
       await legacyPool.query('INSERT INTO flyway_schema_history (installed_rank, version, success) VALUES (12, $1, TRUE)', ['12'])
 
       const result = await migrateDatabase(legacyPool)
-      expect(result.migrationsExecuted).toBe(2)
+      expect(result.migrationsExecuted).toBe(3)
       const migrated = await legacyPool.query(`
         SELECT ca.fecha_hora::text, ca.fecha_hora_fin::text, ca.id_sala, c.tipo_curso
         FROM cursos_agendados ca JOIN cursos c USING (id_curso)

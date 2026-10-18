@@ -15,7 +15,7 @@ import { calendarRoutes } from './routes/calendar.js'
 
 type AppOptions = { pool: Pool; runMigrations?: boolean; logger?: boolean }
 
-export async function createApp({ pool, runMigrations = true, logger = false }: AppOptions): Promise<FastifyInstance> {
+export async function createApp({ pool, runMigrations = config.nodeEnv !== 'production', logger = false }: AppOptions): Promise<FastifyInstance> {
   if (runMigrations) await migrateDatabase(pool)
   await pool.query('DELETE FROM api_sessions WHERE expires_at <= NOW()')
 
@@ -78,6 +78,9 @@ export async function createApp({ pool, runMigrations = true, logger = false }: 
   app.setErrorHandler((error, request, reply) => {
     if (error instanceof ApiError) {
       return reply.code(error.statusCode).send({ message: error.message })
+    }
+    if ((error as { statusCode?: unknown }).statusCode === 429) {
+      return reply.code(429).send({ message: 'Demasiados intentos. Espera antes de volver a probar.' })
     }
     if ((error as { validation?: unknown }).validation) {
       return reply.code(400).send({ message: 'Los datos enviados no son válidos.' })

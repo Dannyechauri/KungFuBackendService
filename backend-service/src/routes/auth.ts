@@ -11,7 +11,20 @@ export const authRoutes: FastifyPluginAsync<AuthRoutesOptions> = async (app, { p
 
   app.post<{ Body: { email?: unknown; password?: unknown } }>(
     '/login',
-    { config: { rateLimit: { max: 60, timeWindow: '15 minutes' } } },
+    {
+      config: {
+        rateLimit: {
+          max: 10,
+          timeWindow: '15 minutes',
+          hook: 'preValidation',
+          keyGenerator: (request) => {
+            const body = request.body as { email?: unknown } | undefined
+            const email = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : '<missing-email>'
+            return `${request.ip}:${email}`
+          },
+        },
+      },
+    },
     async (request, reply) => {
       const user = await authenticate(pool, request.body?.email, request.body?.password)
       const sessionId = newSessionToken()

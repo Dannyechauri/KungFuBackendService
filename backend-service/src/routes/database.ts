@@ -2,9 +2,8 @@ import type { FastifyPluginAsync } from 'fastify'
 import type { Pool } from 'pg'
 
 import { hashPassword, isBcryptHash } from '../auth/auth-service.js'
-import { currentUser, requireRole, Roles, type SessionUser } from '../domain/auth.js'
+import { currentUser, mayManageSchoolData, requireRole, Roles, type SessionUser } from '../domain/auth.js'
 import { ApiError } from '../errors.js'
-import { migrateDatabase } from '../db/migrate.js'
 import {
   cancelCalendarEvent,
   cancelRecurringRule,
@@ -31,7 +30,6 @@ type TableColumnInfo = {
 
 const identifierPattern = /^[a-zA-Z_][a-zA-Z0-9_]*$/u
 const internalTables = new Set(['api_sessions', 'flyway_schema_history', 'node_schema_history'])
-const blockedUserReadTables = new Set(['administradores', 'api_sessions', 'flyway_schema_history', 'node_schema_history'])
 const blockedAllMutationTables = new Set(['api_sessions', 'flyway_schema_history', 'node_schema_history'])
 const selfServiceTables = new Set(['asistencias_curso'])
 const passwordTables = new Set(['alumnos', 'administradores', 'instructores'])
@@ -188,17 +186,12 @@ async function preparePayload(
 function assertCanRead(user: SessionUser | null, tableName: string) {
   if (!user) throw new ApiError(401, 'Inicie sesión para continuar')
   if (internalTables.has(tableName)) throw new ApiError(403, 'No se permite consultar las tablas internas del backend.')
-  if (user.role !== Roles.ADMIN && user.role !== Roles.INSTRUCTOR) {
-    throw new ApiError(403, 'El acceso a los datos de gestión requiere una cuenta de instructor o administrador.')
-  }
-  if (user.role === Roles.INSTRUCTOR && blockedUserReadTables.has(tableName)) {
-    throw new ApiError(403, 'No tiene permisos para consultar esta tabla.')
-  }
+  if (!mayManageSchoolData(user.role)) throw new ApiError(403, 'El acceso a los datos de gestión requiere una cuenta de administrador.')
 }
 
 function assertCanMutate(user: SessionUser, tableName: string) {
   if (blockedAllMutationTables.has(tableName)) throw new ApiError(403, 'No se permite modificar esta tabla.')
-  if (!selfServiceTables.has(tableName) && user.role !== Roles.ADMIN) {
+  if (!mayManageSchoolData(user.role) && !selfServiceTables.has(tableName)) {
     throw new ApiError(403, 'Permiso de administrador requerido')
   }
 }
@@ -220,6 +213,11 @@ function assertOwnAttendance(user: SessionUser, row: Row) {
 }
 
 async function insertRow(pool: Pool, tableName: string, payload: Row) {
+  if (tableName === 'administradores') {
+    const existing = await pool.query('SELECT 1 FROM administradores LIMIT 1')
+    if (existing.rowCount) throw new ApiError(409, 'La aplicación solo admite una cuenta ADMIN.')
+  }
+
   if (tableName === 'salas') {
     const nombre = String(payload.nombre ?? '').trim()
     if (!nombre) throw new ApiError(400, 'Indica el nombre de la sala.')
@@ -376,6 +374,13 @@ async function updateRow(pool: Pool, tableName: string, id: string, payload: Row
 }
 
 async function deleteRow(pool: Pool, tableName: string, id: string) {
+  if (tableName === 'administradores') {
+    const result = await pool.query<{ count: string }>('SELECT COUNT(*)::text AS count FROM administradores')
+    if (Number(result.rows[0]?.count ?? 0) <= 1) {
+      throw new ApiError(409, 'No se puede eliminar la única cuenta ADMIN.')
+    }
+  }
+
   if (tableName === 'salas') {
     await updateCalendarRoom(pool, Number(id), { activo: false })
     return true
@@ -410,18 +415,14 @@ function defaultEndAt(value: string) {
 
 export const databaseRoutes: FastifyPluginAsync<DatabaseRoutesOptions> = async (app, { pool }) => {
   app.get('/tables', async (request) => {
-    const user = currentUser(request)
-    if (!user) throw new ApiError(401, 'Inicie sesión para continuar')
-    if (user.role !== Roles.ADMIN && user.role !== Roles.INSTRUCTOR) {
-      throw new ApiError(403, 'El acceso a los datos de gestión requiere una cuenta de instructor o administrador.')
-    }
+    requireRole(request, [Roles.ADMIN])
     const result = await pool.query<{ table_name: string }>(`
       SELECT table_name FROM information_schema.tables
       WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
       ORDER BY table_name
     `)
     const names = result.rows.map(({ table_name }) => table_name).filter((name) => !internalTables.has(name))
-    return user.role === Roles.ADMIN ? names : names.filter((name) => !blockedUserReadTables.has(name))
+    return names
   })
 
   app.get<{ Params: { tableName: string } }>('/tables/:tableName/columns', async (request) => {
@@ -481,8 +482,4 @@ export const databaseRoutes: FastifyPluginAsync<DatabaseRoutesOptions> = async (
     return { deleted: await deleteRow(pool, tableName, id) }
   })
 
-  app.post('/migrate', async (request) => {
-    requireRole(request, [Roles.ADMIN])
-    return migrateDatabase(pool)
-  })
 }
