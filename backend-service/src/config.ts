@@ -20,6 +20,14 @@ function parseOrigins(value: string | undefined) {
     : ['http://127.0.0.1:8000', 'http://localhost:8000']
 }
 
+function parseTrustedProxies(value: string | undefined): string[] | undefined {
+  const proxies = value
+    ?.split(',')
+    .map((proxy) => proxy.trim())
+    .filter(Boolean)
+  return proxies?.length ? proxies : undefined
+}
+
 export const config = {
   host: process.env.HOST ?? (process.env.NODE_ENV === 'production' ? '0.0.0.0' : '127.0.0.1'),
   port: positiveInteger(process.env.PORT, 8080),
@@ -33,6 +41,7 @@ export const config = {
   corsOrigins: parseOrigins(process.env.CORS_ORIGINS),
   secureCookies: process.env.COOKIE_SECURE === 'true' || process.env.NODE_ENV === 'production',
   sessionKeyHex: process.env.SESSION_KEY,
+  trustedProxies: parseTrustedProxies(process.env.TRUSTED_PROXIES),
 }
 
 export function createDatabaseUrl() {

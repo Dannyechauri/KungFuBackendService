@@ -1,5 +1,6 @@
 import cookie from '@fastify/cookie'
 import cors from '@fastify/cors'
+import rateLimit from '@fastify/rate-limit'
 import secureSession from '@fastify/secure-session'
 import Fastify, { type FastifyInstance } from 'fastify'
 import type { Pool } from 'pg'
@@ -15,14 +16,25 @@ import { calendarRoutes } from './routes/calendar.js'
 
 type AppOptions = { pool: Pool; runMigrations?: boolean; logger?: boolean }
 
+function trustProxySetting(): boolean | string | string[] {
+  if (config.nodeEnv !== 'production') return true
+  return config.trustedProxies ?? false
+}
+
 export async function createApp({ pool, runMigrations = config.nodeEnv !== 'production', logger = false }: AppOptions): Promise<FastifyInstance> {
   if (runMigrations) await migrateDatabase(pool)
   await pool.query('DELETE FROM api_sessions WHERE expires_at <= NOW()')
 
   const app = Fastify({
     logger,
-    trustProxy: config.nodeEnv === 'production',
+    trustProxy: trustProxySetting(),
     bodyLimit: 1_048_576,
+  })
+
+  await app.register(rateLimit, {
+    max: 300,
+    timeWindow: '1 minute',
+    keyGenerator: (request) => request.ip ?? 'unknown',
   })
 
   await app.register(cors, {

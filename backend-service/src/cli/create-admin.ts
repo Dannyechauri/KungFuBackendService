@@ -1,7 +1,7 @@
 import { createInterface } from 'node:readline/promises'
 import { stdin, stdout } from 'node:process'
 
-import { hashPassword } from '../auth/auth-service.js'
+import { hashPassword, validatePassword } from '../auth/auth-service.js'
 import { createPool } from '../db/pool.js'
 import { migrateDatabase } from '../db/migrate.js'
 
@@ -54,7 +54,7 @@ async function main() {
 
     const password = await readHidden('Contraseña ADMIN (mínimo 12 caracteres): ')
     const confirmation = await readHidden('Repite la contraseña: ')
-    if (password.length < 12) throw new Error('La contraseña debe tener al menos 12 caracteres.')
+    validatePassword(password)
     if (password !== confirmation) throw new Error('Las contraseñas no coinciden.')
 
     const passwordHash = await hashPassword(password)

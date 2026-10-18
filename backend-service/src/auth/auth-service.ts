@@ -5,6 +5,8 @@ import type { Pool } from 'pg'
 import { ApiError } from '../errors.js'
 import type { SessionUser, UserRole } from '../domain/auth.js'
 
+const MIN_PASSWORD_LENGTH = 12
+
 type AuthCandidate = {
   role: UserRole
   user_id: number
@@ -12,13 +14,14 @@ type AuthCandidate = {
   password_hash: string | null
 }
 
-export async function authenticate(pool: Pool, emailInput: unknown, passwordInput: unknown): Promise<SessionUser> {
-  if (typeof emailInput !== 'string' || !emailInput.trim() || typeof passwordInput !== 'string' || !passwordInput) {
-    throw new ApiError(400, 'Correo y contraseña son obligatorios.')
+export function validatePassword(value: unknown): asserts value is string {
+  if (typeof value !== 'string' || value.trim().length < MIN_PASSWORD_LENGTH) {
+    throw new ApiError(400, `La contraseña debe tener al menos ${MIN_PASSWORD_LENGTH} caracteres.`)
   }
+}
 
-  const email = emailInput.trim().toLowerCase()
-  const results = await pool.query<AuthCandidate>(`
+async function findCandidatesByEmail(pool: Pool, email: string): Promise<AuthCandidate[]> {
+  const result = await pool.query<AuthCandidate>(`
     SELECT 'ADMIN'::text AS role, id_administrador AS user_id,
            COALESCE(nombre, 'Administrador') AS display_name, password_hash
     FROM administradores
@@ -34,20 +37,56 @@ export async function authenticate(pool: Pool, emailInput: unknown, passwordInpu
     FROM alumnos
     WHERE LOWER(correo_electronico) = $1 AND (activo IS NULL OR activo = TRUE)
   `, [email])
+  return result.rows
+}
 
-  for (const candidate of results.rows) {
+export async function authenticate(pool: Pool, emailInput: unknown, passwordInput: unknown): Promise<SessionUser> {
+  if (typeof emailInput !== 'string' || !emailInput.trim() || typeof passwordInput !== 'string' || !passwordInput) {
+    throw new ApiError(400, 'Correo y contraseña son obligatorios.')
+  }
+
+  const email = emailInput.trim().toLowerCase()
+  const candidates = await findCandidatesByEmail(pool, email)
+  const matches: AuthCandidate[] = []
+
+  for (const candidate of candidates) {
     if (!candidate.password_hash) continue
     if (await bcrypt.compare(passwordInput, candidate.password_hash)) {
-      return {
-        authenticated: true,
-        role: candidate.role,
-        userId: Number(candidate.user_id),
-        displayName: candidate.display_name,
-      }
+      matches.push(candidate)
     }
   }
 
-  throw new ApiError(401, 'Credenciales inválidas')
+  if (matches.length === 0) {
+    throw new ApiError(401, 'Credenciales inválidas')
+  }
+
+  if (matches.length > 1) {
+    // Same credentials in more than one role table is a configuration error.
+    // Refuse to authenticate to avoid role confusion.
+    throw new ApiError(409, 'La cuenta tiene roles duplicados. Contacta con el equipo de desarrollo.')
+  }
+
+  const user = matches[0]!
+  return {
+    authenticated: true,
+    role: user.role,
+    userId: Number(user.user_id),
+    displayName: user.display_name,
+  }
+}
+
+export async function isEmailAvailable(pool: Pool, email: string, exclude?: { table: string; id: number }): Promise<boolean> {
+  const candidates = await findCandidatesByEmail(pool, email)
+  if (!exclude) return candidates.length === 0
+
+  const identityColumn =
+    exclude.table === 'administradores' ? 'id_administrador'
+      : exclude.table === 'instructores' ? 'id_instructor'
+        : exclude.table === 'alumnos' ? 'id_alumno'
+          : null
+  if (!identityColumn) return candidates.length === 0
+
+  return candidates.every((candidate) => Number(candidate.user_id) !== exclude.id)
 }
 
 export function isBcryptHash(value: string) {
@@ -63,8 +102,6 @@ export function hashSessionToken(token: string) {
 }
 
 export async function hashPassword(value: unknown) {
-  if (typeof value !== 'string' || value.trim().length <= 6) {
-    throw new ApiError(400, 'La contraseña debe tener más de 6 caracteres.')
-  }
+  validatePassword(value)
   return bcrypt.hash(value.trim(), 10)
 }

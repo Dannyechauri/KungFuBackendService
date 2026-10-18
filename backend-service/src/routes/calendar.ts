@@ -90,41 +90,45 @@ function parseId(value: string) {
   return parsed.data
 }
 
+const readLimit = { config: { rateLimit: { max: 120, timeWindow: '1 minute' } } }
+const writeLimit = { config: { rateLimit: { max: 60, timeWindow: '1 minute' } } }
+
 export const calendarRoutes: FastifyPluginAsync<CalendarRoutesOptions> = async (app, { pool }) => {
-  app.get('/instructors', async (request) => {
+  app.get('/instructors', readLimit, async (request) => {
     requireRole(request, [Roles.ADMIN, Roles.INSTRUCTOR])
     const result = await pool.query<{ id_instructor: number; nombre: string; activo: boolean | null }>(`
       SELECT id_instructor, nombre, activo
       FROM instructores
+      WHERE activo IS NULL OR activo = TRUE
       ORDER BY nombre, id_instructor
     `)
     return result.rows
   })
 
-  app.get('/rooms', async (request) => {
+  app.get('/rooms', readLimit, async (request) => {
     requireUser(request)
     return listCalendarRooms(pool)
   })
 
-  app.post<{ Body: unknown }>('/rooms', async (request, reply) => {
+  app.post<{ Body: unknown }>('/rooms', writeLimit, async (request, reply) => {
     const user = requireUser(request)
     if (!mayManageSchedule(user.role)) throw new ApiError(403, 'Solo el equipo docente puede gestionar las salas.')
     const room = await createCalendarRoom(pool, parseBody(roomInput, request.body))
     return reply.code(201).send(room)
   })
 
-  app.patch<{ Params: { id: string }; Body: unknown }>('/rooms/:id', async (request) => {
+  app.patch<{ Params: { id: string }; Body: unknown }>('/rooms/:id', writeLimit, async (request) => {
     const user = requireUser(request)
     if (!mayManageSchedule(user.role)) throw new ApiError(403, 'Solo el equipo docente puede gestionar las salas.')
     return updateCalendarRoom(pool, parseId(request.params.id), parseBody(roomPatch, request.body))
   })
 
-  app.get('/courses', async (request) => {
+  app.get('/courses', readLimit, async (request) => {
     requireUser(request)
     return listCalendarCourses(pool)
   })
 
-  app.post<{ Body: unknown }>('/courses', async (request, reply) => {
+  app.post<{ Body: unknown }>('/courses', writeLimit, async (request, reply) => {
     const user = requireUser(request)
     if (!mayManageSchedule(user.role)) throw new ApiError(403, 'Solo administradores e instructores pueden gestionar los cursos.')
     const input = parseBody(courseInput, request.body)
@@ -132,13 +136,13 @@ export const calendarRoutes: FastifyPluginAsync<CalendarRoutesOptions> = async (
     return reply.code(201).send(course)
   })
 
-  app.patch<{ Params: { id: string }; Body: unknown }>('/courses/:id', async (request) => {
+  app.patch<{ Params: { id: string }; Body: unknown }>('/courses/:id', writeLimit, async (request) => {
     const user = requireUser(request)
     if (!mayManageSchedule(user.role)) throw new ApiError(403, 'Solo administradores e instructores pueden gestionar los cursos.')
     return updateCalendarCourse(pool, parseId(request.params.id), parseBody(coursePatch, request.body))
   })
 
-  app.get<{ Querystring: { from?: string; to?: string; roomId?: string } }>('/events', async (request) => {
+  app.get<{ Querystring: { from?: string; to?: string; roomId?: string } }>('/events', readLimit, async (request) => {
     requireUser(request)
     if (!request.query.from || !request.query.to) {
       throw new ApiError(400, 'Indica el inicio y el final del intervalo con from y to.')
@@ -147,33 +151,33 @@ export const calendarRoutes: FastifyPluginAsync<CalendarRoutesOptions> = async (
     return listCalendarEvents(pool, request.query.from, request.query.to, roomId)
   })
 
-  app.post<{ Body: unknown }>('/events', async (request, reply) => {
+  app.post<{ Body: unknown }>('/events', writeLimit, async (request, reply) => {
     const user = requireUser(request)
     if (!mayManageSchedule(user.role)) throw new ApiError(403, 'Solo administradores e instructores pueden gestionar la agenda.')
     const event = await createCalendarEvent(pool, parseBody(eventInput, request.body))
     return reply.code(201).send(event)
   })
 
-  app.patch<{ Params: { id: string }; Body: unknown }>('/events/:id', async (request) => {
+  app.patch<{ Params: { id: string }; Body: unknown }>('/events/:id', writeLimit, async (request) => {
     const user = requireUser(request)
     if (!mayManageSchedule(user.role)) throw new ApiError(403, 'Solo administradores e instructores pueden gestionar la agenda.')
     const input = parseBody(eventPatch, request.body)
     return updateCalendarEvent(pool, parseId(request.params.id), input)
   })
 
-  app.post<{ Params: { id: string } }>('/events/:id/cancel', async (request) => {
+  app.post<{ Params: { id: string } }>('/events/:id/cancel', writeLimit, async (request) => {
     const user = requireUser(request)
     if (!mayManageSchedule(user.role)) throw new ApiError(403, 'Solo administradores e instructores pueden gestionar la agenda.')
     return cancelCalendarEvent(pool, parseId(request.params.id))
   })
 
-  app.get('/recurring-rules', async (request) => {
+  app.get('/recurring-rules', readLimit, async (request) => {
     const user = requireUser(request)
     if (!mayManageSchedule(user.role)) throw new ApiError(403, 'Solo administradores e instructores pueden gestionar horarios habituales.')
     return listRecurringRules(pool)
   })
 
-  app.post<{ Body: unknown }>('/recurring-rules', async (request, reply) => {
+  app.post<{ Body: unknown }>('/recurring-rules', writeLimit, async (request, reply) => {
     const user = requireUser(request)
     if (!mayManageSchedule(user.role)) throw new ApiError(403, 'Solo administradores e instructores pueden gestionar horarios habituales.')
     const input = parseBody(recurrenceInput, request.body)
@@ -181,7 +185,7 @@ export const calendarRoutes: FastifyPluginAsync<CalendarRoutesOptions> = async (
     return reply.code(201).send(result)
   })
 
-  app.patch<{ Params: { id: string }; Body: unknown }>('/recurring-rules/:id', async (request) => {
+  app.patch<{ Params: { id: string }; Body: unknown }>('/recurring-rules/:id', writeLimit, async (request) => {
     const user = requireUser(request)
     if (!mayManageSchedule(user.role)) throw new ApiError(403, 'Solo administradores e instructores pueden gestionar horarios habituales.')
     const input = parseBody(recurrencePatch, request.body)

@@ -1,7 +1,7 @@
 import type { FastifyPluginAsync } from 'fastify'
 import type { Pool } from 'pg'
 
-import { hashPassword, isBcryptHash } from '../auth/auth-service.js'
+import { hashPassword, isBcryptHash, isEmailAvailable } from '../auth/auth-service.js'
 import { currentUser, mayManageSchoolData, requireRole, Roles, type SessionUser } from '../domain/auth.js'
 import { ApiError } from '../errors.js'
 import {
@@ -212,11 +212,23 @@ function assertOwnAttendance(user: SessionUser, row: Row) {
   }
 }
 
+const accountTables = new Set(['administradores', 'instructores', 'alumnos'])
+
+async function assertUniqueEmail(pool: Pool, tableName: string, payload: Row) {
+  if (!accountTables.has(tableName)) return
+  const email = typeof payload.correo_electronico === 'string' ? payload.correo_electronico.trim().toLowerCase() : ''
+  if (!email) return
+  const available = await isEmailAvailable(pool, email)
+  if (!available) throw new ApiError(409, 'Ya existe una cuenta con ese correo electrónico.')
+}
+
 async function insertRow(pool: Pool, tableName: string, payload: Row) {
   if (tableName === 'administradores') {
     const existing = await pool.query('SELECT 1 FROM administradores LIMIT 1')
     if (existing.rowCount) throw new ApiError(409, 'La aplicación solo admite una cuenta ADMIN.')
   }
+
+  await assertUniqueEmail(pool, tableName, payload)
 
   if (tableName === 'salas') {
     const nombre = String(payload.nombre ?? '').trim()
@@ -353,6 +365,14 @@ async function updateRow(pool: Pool, tableName: string, id: string, payload: Row
     if (activeRule.rows[0]) throw new ApiError(409, 'Cancela los horarios habituales antes de convertir este curso en especial.')
   }
 
+  if (accountTables.has(tableName) && payload.correo_electronico !== undefined) {
+    const email = typeof payload.correo_electronico === 'string' ? payload.correo_electronico.trim().toLowerCase() : ''
+    if (email) {
+      const available = await isEmailAvailable(pool, email, { table: tableName, id: Number(id) })
+      if (!available) throw new ApiError(409, 'Ya existe otra cuenta con ese correo electrónico.')
+    }
+  }
+
   await ensureTableExists(pool, tableName)
   const keys = await primaryKeyColumns(pool, tableName)
   if (!keys.length) throw new ApiError(400, `La tabla '${tableName}' no tiene clave primaria.`)
@@ -413,8 +433,11 @@ function defaultEndAt(value: string) {
   return `${wallClock.toISOString().slice(0, 19)}`
 }
 
+const readLimit = { config: { rateLimit: { max: 60, timeWindow: '1 minute' } } }
+const writeLimit = { config: { rateLimit: { max: 60, timeWindow: '1 minute' } } }
+
 export const databaseRoutes: FastifyPluginAsync<DatabaseRoutesOptions> = async (app, { pool }) => {
-  app.get('/tables', async (request) => {
+  app.get('/tables', readLimit, async (request) => {
     requireRole(request, [Roles.ADMIN])
     const result = await pool.query<{ table_name: string }>(`
       SELECT table_name FROM information_schema.tables
@@ -425,7 +448,7 @@ export const databaseRoutes: FastifyPluginAsync<DatabaseRoutesOptions> = async (
     return names
   })
 
-  app.get<{ Params: { tableName: string } }>('/tables/:tableName/columns', async (request) => {
+  app.get<{ Params: { tableName: string } }>('/tables/:tableName/columns', readLimit, async (request) => {
     const { tableName } = request.params
     assertCanRead(currentUser(request), tableName)
     return tableColumns(pool, tableName)
@@ -433,6 +456,7 @@ export const databaseRoutes: FastifyPluginAsync<DatabaseRoutesOptions> = async (
 
   app.get<{ Params: { tableName: string }; Querystring: { limit?: string } }>(
     '/tables/:tableName/rows',
+    readLimit,
     async (request) => {
       const { tableName } = request.params
       assertCanRead(currentUser(request), tableName)
@@ -447,7 +471,7 @@ export const databaseRoutes: FastifyPluginAsync<DatabaseRoutesOptions> = async (
     },
   )
 
-  app.post<{ Params: { tableName: string }; Body: Row }>('/tables/:tableName/rows', async (request) => {
+  app.post<{ Params: { tableName: string }; Body: Row }>('/tables/:tableName/rows', writeLimit, async (request) => {
     const user = requireRole(request, [Roles.ADMIN, Roles.INSTRUCTOR, Roles.USER])
     const { tableName } = request.params
     assertCanMutate(user, tableName)
@@ -456,7 +480,7 @@ export const databaseRoutes: FastifyPluginAsync<DatabaseRoutesOptions> = async (
     return insertRow(pool, tableName, data)
   })
 
-  app.put<{ Params: { tableName: string; id: string }; Body: Row }>('/tables/:tableName/rows/:id', async (request) => {
+  app.put<{ Params: { tableName: string; id: string }; Body: Row }>('/tables/:tableName/rows/:id', writeLimit, async (request) => {
     const user = requireRole(request, [Roles.ADMIN])
     const { tableName, id } = request.params
     assertCanMutate(user, tableName)
@@ -466,7 +490,7 @@ export const databaseRoutes: FastifyPluginAsync<DatabaseRoutesOptions> = async (
     return updateRow(pool, tableName, id, request.body ?? {})
   })
 
-  app.delete<{ Params: { tableName: string; id: string } }>('/tables/:tableName/rows/:id', async (request) => {
+  app.delete<{ Params: { tableName: string; id: string } }>('/tables/:tableName/rows/:id', writeLimit, async (request) => {
     const user = requireRole(request, [Roles.ADMIN, Roles.INSTRUCTOR, Roles.USER])
     const { tableName, id } = request.params
     assertCanMutate(user, tableName)

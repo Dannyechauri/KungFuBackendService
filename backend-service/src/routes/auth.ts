@@ -1,5 +1,4 @@
 import type { FastifyPluginAsync } from 'fastify'
-import rateLimit from '@fastify/rate-limit'
 
 import { authenticate, hashSessionToken, newSessionToken } from '../auth/auth-service.js'
 import { requireUser } from '../domain/auth.js'
@@ -7,7 +6,6 @@ import { requireUser } from '../domain/auth.js'
 type AuthRoutesOptions = { pool: import('pg').Pool }
 
 export const authRoutes: FastifyPluginAsync<AuthRoutesOptions> = async (app, { pool }) => {
-  await app.register(rateLimit, { global: false })
 
   app.post<{ Body: { email?: unknown; password?: unknown } }>(
     '/login',

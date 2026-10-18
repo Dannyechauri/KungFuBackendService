@@ -15,6 +15,11 @@ export function createPool(databaseUrl = createDatabaseUrl()): Pool {
     max: 10,
     connectionTimeoutMillis: 8_000,
     idleTimeoutMillis: 30_000,
+    // The application stores and compares all wall-clock timestamps in the
+    // school's local timezone (Europe/Madrid). Force every session to that
+    // timezone so containers or cloud instances configured as UTC do not shift
+    // hours silently.
+    options: '-c timezone=Europe/Madrid',
   })
 }
 
