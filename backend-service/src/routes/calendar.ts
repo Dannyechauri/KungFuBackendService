@@ -2,8 +2,9 @@ import type { FastifyPluginAsync } from 'fastify'
 import type { Pool } from 'pg'
 import { z } from 'zod'
 
-import { mayManageSchedule, requireRole, requireUser, Roles } from '../domain/auth.js'
+import { mayManageSchedule, mayManageSchoolData, requireRole, requireUser, Roles, type SessionUser } from '../domain/auth.js'
 import { ApiError } from '../errors.js'
+import { joinEvent, leaveEvent, listEventParticipants } from '../agenda/participation-service.js'
 import {
   cancelCalendarEvent,
   cancelRecurringRule,
@@ -28,12 +29,17 @@ const localDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/u)
 const localTime = z.string().regex(/^\d{2}:\d{2}(?::\d{2})?$/u)
 const localDateTime = z.string().regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?$/u)
 
+const participantLimit = z.number().int().positive().max(10_000).nullable().optional()
+const showAttendeeCount = z.boolean().optional()
+
 const eventInput = z.object({
   courseId: identifier,
   instructorId: identifier,
   roomId: identifier,
   startAt: localDateTime,
   endAt: localDateTime,
+  participantLimit,
+  showAttendeeCount,
 }).strict()
 
 const eventPatch = z.object({
@@ -42,6 +48,8 @@ const eventPatch = z.object({
   roomId: identifier.nullable().optional(),
   startAt: localDateTime.optional(),
   endAt: localDateTime.optional(),
+  participantLimit,
+  showAttendeeCount,
 }).strict().refine((value) => Object.keys(value).length > 0)
 const courseInput = z.object({
   nombre: z.string().trim().min(1).max(100),
@@ -60,6 +68,8 @@ const recurrenceInput = z.object({
   endTime: localTime,
   startsOn: localDate,
   endsOn: localDate.nullable().optional(),
+  participantLimit,
+  showAttendeeCount,
 }).strict()
 
 const recurrencePatch = z.object({
@@ -71,7 +81,14 @@ const recurrencePatch = z.object({
   endTime: localTime.optional(),
   startsOn: localDate.optional(),
   endsOn: localDate.nullable().optional(),
+  participantLimit,
+  showAttendeeCount,
 }).strict().refine((value) => Object.keys(value).length > 0)
+const participationInput = z.object({
+  scope: z.enum(['occurrence', 'series']).default('occurrence'),
+  role: z.enum(['ALUMNO', 'INSTRUCTOR']).default('ALUMNO'),
+}).strict()
+const participationScope = z.enum(['occurrence', 'series']).default('occurrence')
 const roomInput = z.object({ nombre: z.string().trim().min(1).max(100) }).strict()
 const roomPatch = z.object({
   nombre: z.string().trim().min(1).max(100).optional(),
@@ -88,6 +105,12 @@ function parseId(value: string) {
   const parsed = identifier.safeParse(value)
   if (!parsed.success) throw new ApiError(400, 'Identificador inválido.')
   return parsed.data
+}
+
+function assertSettingsAllowed(user: SessionUser, input: { participantLimit?: unknown; showAttendeeCount?: unknown }) {
+  if (user.role !== Roles.ADMIN && (input.participantLimit !== undefined || input.showAttendeeCount !== undefined)) {
+    throw new ApiError(403, 'Solo el administrador puede cambiar el límite de participantes y la visibilidad de asistentes.')
+  }
 }
 
 const readLimit = { config: { rateLimit: { max: 120, timeWindow: '1 minute' } } }
@@ -112,14 +135,14 @@ export const calendarRoutes: FastifyPluginAsync<CalendarRoutesOptions> = async (
 
   app.post<{ Body: unknown }>('/rooms', writeLimit, async (request, reply) => {
     const user = requireUser(request)
-    if (!mayManageSchedule(user.role)) throw new ApiError(403, 'Solo el equipo docente puede gestionar las salas.')
+    if (!mayManageSchoolData(user.role)) throw new ApiError(403, 'Solo el administrador puede gestionar las salas.')
     const room = await createCalendarRoom(pool, parseBody(roomInput, request.body))
     return reply.code(201).send(room)
   })
 
   app.patch<{ Params: { id: string }; Body: unknown }>('/rooms/:id', writeLimit, async (request) => {
     const user = requireUser(request)
-    if (!mayManageSchedule(user.role)) throw new ApiError(403, 'Solo el equipo docente puede gestionar las salas.')
+    if (!mayManageSchoolData(user.role)) throw new ApiError(403, 'Solo el administrador puede gestionar las salas.')
     return updateCalendarRoom(pool, parseId(request.params.id), parseBody(roomPatch, request.body))
   })
 
@@ -130,7 +153,7 @@ export const calendarRoutes: FastifyPluginAsync<CalendarRoutesOptions> = async (
 
   app.post<{ Body: unknown }>('/courses', writeLimit, async (request, reply) => {
     const user = requireUser(request)
-    if (!mayManageSchedule(user.role)) throw new ApiError(403, 'Solo administradores e instructores pueden gestionar los cursos.')
+    if (!mayManageSchoolData(user.role)) throw new ApiError(403, 'Solo el administrador puede gestionar los cursos.')
     const input = parseBody(courseInput, request.body)
     const course = await createCalendarCourse(pool, { ...input, descripcion: input.descripcion ?? null })
     return reply.code(201).send(course)
@@ -138,23 +161,28 @@ export const calendarRoutes: FastifyPluginAsync<CalendarRoutesOptions> = async (
 
   app.patch<{ Params: { id: string }; Body: unknown }>('/courses/:id', writeLimit, async (request) => {
     const user = requireUser(request)
-    if (!mayManageSchedule(user.role)) throw new ApiError(403, 'Solo administradores e instructores pueden gestionar los cursos.')
+    if (!mayManageSchoolData(user.role)) throw new ApiError(403, 'Solo el administrador puede gestionar los cursos.')
     return updateCalendarCourse(pool, parseId(request.params.id), parseBody(coursePatch, request.body))
   })
 
   app.get<{ Querystring: { from?: string; to?: string; roomId?: string } }>('/events', readLimit, async (request) => {
-    requireUser(request)
+    const user = requireUser(request)
     if (!request.query.from || !request.query.to) {
       throw new ApiError(400, 'Indica el inicio y el final del intervalo con from y to.')
     }
     const roomId = request.query.roomId === undefined ? undefined : parseId(request.query.roomId)
-    return listCalendarEvents(pool, request.query.from, request.query.to, roomId)
+    return listCalendarEvents(pool, request.query.from, request.query.to, roomId, {
+      role: user.role,
+      studentId: user.studentId ?? null,
+    })
   })
 
   app.post<{ Body: unknown }>('/events', writeLimit, async (request, reply) => {
     const user = requireUser(request)
     if (!mayManageSchedule(user.role)) throw new ApiError(403, 'Solo administradores e instructores pueden gestionar la agenda.')
-    const event = await createCalendarEvent(pool, parseBody(eventInput, request.body))
+    const input = parseBody(eventInput, request.body)
+    assertSettingsAllowed(user, input)
+    const event = await createCalendarEvent(pool, input)
     return reply.code(201).send(event)
   })
 
@@ -162,7 +190,32 @@ export const calendarRoutes: FastifyPluginAsync<CalendarRoutesOptions> = async (
     const user = requireUser(request)
     if (!mayManageSchedule(user.role)) throw new ApiError(403, 'Solo administradores e instructores pueden gestionar la agenda.')
     const input = parseBody(eventPatch, request.body)
+    assertSettingsAllowed(user, input)
     return updateCalendarEvent(pool, parseId(request.params.id), input)
+  })
+
+  app.get<{ Params: { id: string } }>('/events/:id/participants', readLimit, async (request) => {
+    const user = requireUser(request)
+    if (!mayManageSchedule(user.role)) throw new ApiError(403, 'Solo administradores e instructores pueden ver la lista de participantes.')
+    return listEventParticipants(pool, parseId(request.params.id))
+  })
+
+  app.post<{ Params: { id: string }; Body: unknown }>('/events/:id/participation', writeLimit, async (request) => {
+    const user = requireUser(request)
+    const input = parseBody(participationInput, request.body ?? {})
+    return joinEvent(pool, {
+      studentId: user.studentId ?? null,
+      instructorId: user.instructorId ?? null,
+    }, parseId(request.params.id), input.scope, input.role)
+  })
+
+  app.delete<{ Params: { id: string }; Querystring: { scope?: string } }>('/events/:id/participation', writeLimit, async (request) => {
+    const user = requireUser(request)
+    const scope = parseBody(participationScope, request.query.scope)
+    return leaveEvent(pool, {
+      studentId: user.studentId ?? null,
+      instructorId: user.instructorId ?? null,
+    }, parseId(request.params.id), scope)
   })
 
   app.post<{ Params: { id: string } }>('/events/:id/cancel', writeLimit, async (request) => {
@@ -181,6 +234,7 @@ export const calendarRoutes: FastifyPluginAsync<CalendarRoutesOptions> = async (
     const user = requireUser(request)
     if (!mayManageSchedule(user.role)) throw new ApiError(403, 'Solo administradores e instructores pueden gestionar horarios habituales.')
     const input = parseBody(recurrenceInput, request.body)
+    assertSettingsAllowed(user, input)
     const result = await createRecurringRules(pool, { ...input, endsOn: input.endsOn ?? null })
     return reply.code(201).send(result)
   })
@@ -189,6 +243,7 @@ export const calendarRoutes: FastifyPluginAsync<CalendarRoutesOptions> = async (
     const user = requireUser(request)
     if (!mayManageSchedule(user.role)) throw new ApiError(403, 'Solo administradores e instructores pueden gestionar horarios habituales.')
     const input = parseBody(recurrencePatch, request.body)
+    assertSettingsAllowed(user, input)
     return updateRecurringRule(pool, parseId(request.params.id), input)
   })
 

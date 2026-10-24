@@ -5,14 +5,15 @@ import secureSession from '@fastify/secure-session'
 import Fastify, { type FastifyInstance } from 'fastify'
 import type { Pool } from 'pg'
 
-import { hashSessionToken } from './auth/auth-service.js'
+import { hashSessionToken, resolveSessionUser } from './auth/auth-service.js'
 import { config, getSessionKey } from './config.js'
 import { ApiError } from './errors.js'
 import { migrateDatabase } from './db/migrate.js'
-import { type SessionUser, type UserRole } from './domain/auth.js'
+import { Roles, type AccountRole } from './domain/auth.js'
 import { authRoutes } from './routes/auth.js'
 import { databaseRoutes } from './routes/database.js'
 import { calendarRoutes } from './routes/calendar.js'
+import { meRoutes } from './routes/me.js'
 
 type AppOptions = { pool: Pool; runMigrations?: boolean; logger?: boolean }
 
@@ -65,26 +66,25 @@ export async function createApp({ pool, runMigrations = config.nodeEnv !== 'prod
     }
 
     const result = await pool.query<{
-      role: UserRole
+      role: AccountRole | typeof Roles.INSTRUCTOR
       user_id: string
-      display_name: string
     }>(`
-      SELECT role, user_id::text, display_name
+      SELECT role, user_id::text
       FROM api_sessions
       WHERE session_hash = $1 AND expires_at > NOW()
     `, [hashSessionToken(sessionId)])
     const session = result.rows[0]
-    if (!session) {
+    // Las sesiones con rol INSTRUCTOR son anteriores a V16 y ya no son válidas.
+    const user = session && session.role !== Roles.INSTRUCTOR
+      ? await resolveSessionUser(pool, session.role, Number(session.user_id))
+      : null
+    if (!user) {
+      if (session) await pool.query('DELETE FROM api_sessions WHERE session_hash = $1', [hashSessionToken(sessionId)])
       request.session.delete()
       request.currentUser = null
       return
     }
-    request.currentUser = {
-      authenticated: true,
-      role: session.role,
-      userId: Number(session.user_id),
-      displayName: session.display_name,
-    } satisfies SessionUser
+    request.currentUser = user
   })
 
   app.setErrorHandler((error, request, reply) => {
@@ -100,6 +100,7 @@ export async function createApp({ pool, runMigrations = config.nodeEnv !== 'prod
 
     const pgCode = (error as { code?: string }).code
     if (pgCode === '23505') return reply.code(409).send({ message: 'Ya existe un registro con esos datos.' })
+    if (pgCode === '23001') return reply.code(409).send({ message: 'No se pueden borrar asistencias de fechas pasadas.' })
     if (pgCode === '23503' || pgCode === '23514' || pgCode === '22P02' || pgCode === '22007' || pgCode === '22001') {
       return reply.code(400).send({ message: 'Los datos enviados no son válidos.' })
     }
@@ -122,6 +123,7 @@ export async function createApp({ pool, runMigrations = config.nodeEnv !== 'prod
   await app.register(authRoutes, { prefix: '/api/auth', pool })
   await app.register(databaseRoutes, { prefix: '/api/database', pool })
   await app.register(calendarRoutes, { prefix: '/api/calendar', pool })
+  await app.register(meRoutes, { prefix: '/api/me', pool })
 
   return app
 }

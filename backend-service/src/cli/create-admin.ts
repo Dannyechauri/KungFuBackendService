@@ -1,7 +1,7 @@
 import { createInterface } from 'node:readline/promises'
 import { stdin, stdout } from 'node:process'
 
-import { hashPassword, validatePassword } from '../auth/auth-service.js'
+import { hashPassword, MIN_PASSWORD_LENGTH, validatePassword } from '../auth/auth-service.js'
 import { createPool } from '../db/pool.js'
 import { migrateDatabase } from '../db/migrate.js'
 
@@ -52,7 +52,7 @@ async function main() {
     const existing = await pool.query('SELECT 1 FROM administradores LIMIT 1')
     if (existing.rowCount) throw new Error('Ya existe una cuenta ADMIN; no se creará otra.')
 
-    const password = await readHidden('Contraseña ADMIN (mínimo 12 caracteres): ')
+    const password = await readHidden(`Contraseña ADMIN (mínimo ${MIN_PASSWORD_LENGTH} caracteres): `)
     const confirmation = await readHidden('Repite la contraseña: ')
     validatePassword(password)
     if (password !== confirmation) throw new Error('Las contraseñas no coinciden.')

@@ -10,11 +10,17 @@ export const Roles = {
 
 export type UserRole = (typeof Roles)[keyof typeof Roles]
 
+/** Solo administradores y alumnos tienen cuenta; INSTRUCTOR es un rol derivado del alumno. */
+export type AccountRole = typeof Roles.ADMIN | typeof Roles.USER
+
 export type SessionUser = {
   authenticated: true
   role: UserRole
+  /** id_administrador para ADMIN, id_alumno para alumnos e instructores. */
   userId: number
   displayName: string
+  studentId: number | null
+  instructorId: number | null
 }
 
 export function currentUser(request: FastifyRequest): SessionUser | null {
@@ -37,6 +43,7 @@ export function mayManageSchedule(role: UserRole) {
   return role === Roles.ADMIN || role === Roles.INSTRUCTOR
 }
 
+/** Altas y cambios del catálogo (cursos, salas, alumnos, grados, formas…). */
 export function mayManageSchoolData(role: UserRole) {
   return role === Roles.ADMIN
 }
