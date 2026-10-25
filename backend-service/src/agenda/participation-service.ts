@@ -90,25 +90,50 @@ export async function joinEvent(
 
     const ruleId = event.id_horario_recurrente
     if (ruleId === null) throw new ApiError(400, 'Esta actividad no forma parte de una serie.')
-    const rule = await client.query(
-      'SELECT 1 FROM horarios_recurrentes WHERE id_horario_recurrente = $1 AND activo = TRUE',
+    const rule = await client.query<{
+      id_horario_recurrente: number
+      id_curso: number
+      id_instructor: number
+      id_sala: number | null
+      hora_inicio: string
+      hora_fin: string
+      fecha_inicio: string
+      fecha_fin: string | null
+    }>(`
+      SELECT id_horario_recurrente, id_curso, id_instructor, id_sala,
+             hora_inicio::text, hora_fin::text, fecha_inicio::text, fecha_fin::text
+      FROM horarios_recurrentes WHERE id_horario_recurrente = $1 AND activo = TRUE
+    `,
       [ruleId],
     )
-    if (!rule.rows[0]) throw new ApiError(409, 'El horario habitual de esta actividad ya no está activo.')
+    const selectedRule = rule.rows[0]
+    if (!selectedRule) throw new ApiError(409, 'El horario habitual de esta actividad ya no está activo.')
+
+    const seriesRules = await client.query<{ id_horario_recurrente: number }>(`
+      SELECT id_horario_recurrente
+      FROM horarios_recurrentes
+      WHERE activo = TRUE AND id_curso = $1 AND id_instructor = $2
+        AND id_sala IS NOT DISTINCT FROM $3
+        AND hora_inicio = $4::time AND hora_fin = $5::time
+        AND fecha_inicio = $6::date AND fecha_fin IS NOT DISTINCT FROM $7::date
+    `, [selectedRule.id_curso, selectedRule.id_instructor, selectedRule.id_sala,
+      selectedRule.hora_inicio, selectedRule.hora_fin, selectedRule.fecha_inicio, selectedRule.fecha_fin])
+    const seriesRuleIds = seriesRules.rows.map((row) => Number(row.id_horario_recurrente))
 
     await client.query(`
       INSERT INTO participaciones_serie (id_horario_recurrente, id_alumno, rol, fecha_desde)
-      VALUES ($1, $2, $3, $4::date)
+      SELECT rule_id, $2, $3, $4::date
+      FROM unnest($1::bigint[]) AS rules(rule_id)
       ON CONFLICT (id_horario_recurrente, id_alumno)
       DO UPDATE SET rol = EXCLUDED.rol, fecha_desde = EXCLUDED.fecha_desde
-    `, [ruleId, studentId, role, event.fecha_recurrencia ?? event.fecha_hora.slice(0, 10)])
+    `, [seriesRuleIds, studentId, role, event.fecha_recurrencia ?? event.fecha_hora.slice(0, 10)])
 
     const occurrences = await client.query<{ id_curso_agendado: number; fecha: string; limite_participantes: number | null }>(`
       SELECT id_curso_agendado, to_char(fecha_hora, 'YYYY-MM-DD') AS fecha, limite_participantes
       FROM cursos_agendados
-      WHERE id_horario_recurrente = $1 AND activo = TRUE AND fecha_hora >= $2::timestamp
+      WHERE id_horario_recurrente = ANY($1::bigint[]) AND activo = TRUE AND fecha_hora >= $2::timestamp
       ORDER BY fecha_hora
-    `, [ruleId, event.fecha_hora])
+    `, [seriesRuleIds, event.fecha_hora])
 
     const joined: number[] = []
     const skipped: string[] = []
@@ -140,17 +165,30 @@ export async function leaveEvent(pool: Pool, participant: Participant, eventId: 
     }
 
     if (event.id_horario_recurrente === null) throw new ApiError(400, 'Esta actividad no forma parte de una serie.')
+    const seriesRules = await client.query<{ id_horario_recurrente: number }>(`
+      SELECT sibling.id_horario_recurrente
+      FROM horarios_recurrentes selected
+      JOIN horarios_recurrentes sibling
+        ON sibling.activo = TRUE AND sibling.id_curso = selected.id_curso
+        AND sibling.id_instructor = selected.id_instructor
+        AND sibling.id_sala IS NOT DISTINCT FROM selected.id_sala
+        AND sibling.hora_inicio = selected.hora_inicio AND sibling.hora_fin = selected.hora_fin
+        AND sibling.fecha_inicio = selected.fecha_inicio
+        AND sibling.fecha_fin IS NOT DISTINCT FROM selected.fecha_fin
+      WHERE selected.id_horario_recurrente = $1
+    `, [event.id_horario_recurrente])
+    const seriesRuleIds = seriesRules.rows.map((row) => Number(row.id_horario_recurrente))
     const series = await client.query(
-      'DELETE FROM participaciones_serie WHERE id_horario_recurrente = $1 AND id_alumno = $2',
-      [event.id_horario_recurrente, studentId],
+      'DELETE FROM participaciones_serie WHERE id_horario_recurrente = ANY($1::bigint[]) AND id_alumno = $2',
+      [seriesRuleIds, studentId],
     )
     const removed = await client.query(`
       DELETE FROM participaciones_evento pe
       USING cursos_agendados ca
       WHERE pe.id_curso_agendado = ca.id_curso_agendado
-        AND ca.id_horario_recurrente = $1 AND pe.id_alumno = $2
+        AND ca.id_horario_recurrente = ANY($1::bigint[]) AND pe.id_alumno = $2
         AND ca.fecha_hora >= $3::timestamp
-    `, [event.id_horario_recurrente, studentId, event.fecha_hora])
+      `, [seriesRuleIds, studentId, event.fecha_hora])
     if (!series.rowCount && !removed.rowCount) throw new ApiError(404, 'No estabas apuntado a esta serie.')
     return { scope, removed: removed.rowCount ?? 0 }
   })

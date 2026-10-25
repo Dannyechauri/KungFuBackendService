@@ -1,8 +1,9 @@
 import type { FastifyPluginAsync } from 'fastify'
 import type { Pool } from 'pg'
+import { z } from 'zod'
 
 import { hashPassword, isBcryptHash, isEmailAvailable } from '../auth/auth-service.js'
-import { currentUser, mayManageSchoolData, requireRole, Roles, type SessionUser } from '../domain/auth.js'
+import { currentUser, requireRole, Roles, type SessionUser } from '../domain/auth.js'
 import { ApiError } from '../errors.js'
 import {
   cancelCalendarEvent,
@@ -30,9 +31,19 @@ type TableColumnInfo = {
 
 const identifierPattern = /^[a-zA-Z_][a-zA-Z0-9_]*$/u
 const internalTables = new Set(['api_sessions', 'flyway_schema_history', 'node_schema_history'])
+const unlistedTables = new Set(['asistencias_curso'])
 const blockedAllMutationTables = new Set(['api_sessions', 'flyway_schema_history', 'node_schema_history'])
 const selfServiceTables = new Set(['asistencias_curso'])
 const passwordTables = new Set(['alumnos', 'administradores'])
+const instructorVisibleTables = new Set(['alumnos', 'cursos', 'formas', 'estilos', 'cursos_agendados', 'horarios_recurrentes'])
+const instructorReadableTables = new Set([
+  ...instructorVisibleTables,
+  'grado_forma', 'grados', 'instructores', 'salas',
+])
+const instructorStudentEditableFields = new Set([
+  'nombre', 'numero_matricula', 'fecha_nacimiento', 'fecha_ingreso', 'correo_electronico', 'id_grado',
+])
+const progressInput = z.object({ percent: z.number().int().min(0).max(100) }).strict()
 
 function quoteIdentifier(value: string) {
   if (!identifierPattern.test(value)) throw new ApiError(400, 'Nombre de tabla o columna inválido.')
@@ -188,14 +199,17 @@ async function preparePayload(
 function assertCanRead(user: SessionUser | null, tableName: string) {
   if (!user) throw new ApiError(401, 'Inicie sesión para continuar')
   if (internalTables.has(tableName)) throw new ApiError(403, 'No se permite consultar las tablas internas del backend.')
-  if (!mayManageSchoolData(user.role)) throw new ApiError(403, 'El acceso a los datos de gestión requiere una cuenta de administrador.')
+  if (user.role === Roles.ADMIN) return
+  if (user.role === Roles.INSTRUCTOR && instructorReadableTables.has(tableName)) return
+  throw new ApiError(403, 'No tiene permisos para consultar estos datos.')
 }
 
-function assertCanMutate(user: SessionUser, tableName: string) {
+function assertCanMutate(user: SessionUser, tableName: string, operation: 'create' | 'update' | 'delete') {
   if (blockedAllMutationTables.has(tableName)) throw new ApiError(403, 'No se permite modificar esta tabla.')
-  if (!mayManageSchoolData(user.role) && !selfServiceTables.has(tableName)) {
-    throw new ApiError(403, 'Permiso de administrador requerido')
-  }
+  if (user.role === Roles.ADMIN) return
+  if (user.role === Roles.INSTRUCTOR && operation === 'update' && tableName === 'alumnos') return
+  if (operation !== 'update' && selfServiceTables.has(tableName)) return
+  throw new ApiError(403, 'No tiene permisos para modificar estos datos.')
 }
 
 function assertOwnAttendance(user: SessionUser, row: Row) {
@@ -224,8 +238,6 @@ async function assertUniqueEmail(pool: Pool, tableName: string, payload: Row) {
 
 async function insertRow(pool: Pool, tableName: string, payload: Row) {
   if (tableName === 'administradores') {
-    const existing = await pool.query('SELECT 1 FROM administradores LIMIT 1')
-    if (existing.rowCount) throw new ApiError(409, 'La aplicación solo admite una cuenta ADMIN.')
     if (typeof payload.password_hash !== 'string' || !payload.password_hash.trim()) {
       throw new ApiError(400, 'Indica una contraseña para la cuenta ADMIN.')
     }
@@ -452,18 +464,20 @@ const writeLimit = { config: { rateLimit: { max: 60, timeWindow: '1 minute' } } 
 
 export const databaseRoutes: FastifyPluginAsync<DatabaseRoutesOptions> = async (app, { pool }) => {
   app.get('/tables', readLimit, async (request) => {
-    requireRole(request, [Roles.ADMIN])
+    const user = requireRole(request, [Roles.ADMIN, Roles.INSTRUCTOR])
     const result = await pool.query<{ table_name: string }>(`
       SELECT table_name FROM information_schema.tables
       WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
       ORDER BY table_name
     `)
-    const names = result.rows.map(({ table_name }) => table_name).filter((name) => !internalTables.has(name))
+    const names = user.role === Roles.ADMIN
+      ? result.rows.map(({ table_name }) => table_name).filter((name) => !internalTables.has(name) && !unlistedTables.has(name))
+      : result.rows.map(({ table_name }) => table_name).filter((name) => instructorVisibleTables.has(name))
     return names
   })
 
   app.get<{ Params: { studentId: string } }>('/students/:studentId/known-forms', readLimit, async (request) => {
-    requireRole(request, [Roles.ADMIN])
+    requireRole(request, [Roles.ADMIN, Roles.INSTRUCTOR])
     const [studentId] = parsePrimaryKeyValues(request.params.studentId, 1)
     const result = await pool.query<Row>(`
       SELECT af.id_alumno::text, af.id_forma::text,
@@ -477,6 +491,53 @@ export const databaseRoutes: FastifyPluginAsync<DatabaseRoutesOptions> = async (
     `, [studentId])
     return result.rows
   })
+
+  app.get<{ Params: { studentId: string } }>('/students/:studentId/learning-forms', readLimit, async (request) => {
+    requireRole(request, [Roles.ADMIN, Roles.INSTRUCTOR])
+    const [studentId] = parsePrimaryKeyValues(request.params.studentId, 1)
+    const result = await pool.query<Row>(`
+      SELECT p.id_alumno::text, p.id_forma::text, p.porcentaje,
+             to_char(p.fecha_actualizacion, 'YYYY-MM-DD') AS fecha_actualizacion,
+             f.nombre, f.descripcion, f.id_estilo::text, e.nombre AS estilo
+      FROM alumno_forma_progreso p
+      JOIN formas f ON f.id_forma = p.id_forma
+      JOIN estilos e ON e.id_estilo = f.id_estilo
+      WHERE p.id_alumno = $1
+      ORDER BY e.nombre, f.nombre
+    `, [studentId])
+    return result.rows
+  })
+
+  app.put<{ Params: { studentId: string; formId: string }; Body: unknown }>(
+    '/students/:studentId/forms/:formId/progress', writeLimit, async (request) => {
+      requireRole(request, [Roles.ADMIN, Roles.INSTRUCTOR])
+      const [studentId] = parsePrimaryKeyValues(request.params.studentId, 1)
+      const [formId] = parsePrimaryKeyValues(request.params.formId, 1)
+      const parsed = progressInput.safeParse(request.body ?? {})
+      if (!parsed.success) throw new ApiError(400, 'El avance debe ser un número entero entre 0 y 100.')
+
+      const form = await pool.query<{ sabida: boolean }>(`
+        SELECT EXISTS (
+          SELECT 1 FROM alumno_forma af WHERE af.id_alumno = $1 AND af.id_forma = gf.id_forma
+        ) AS sabida
+        FROM alumnos a
+        JOIN grado_forma gf ON gf.id_grado = a.id_grado AND gf.id_forma = $2
+        WHERE a.id_alumno = $1
+      `, [studentId, formId])
+      if (!form.rows[0]) throw new ApiError(404, 'Esa forma no pertenece al grado actual del alumno.')
+      if (form.rows[0].sabida) throw new ApiError(409, 'Esa forma ya figura como sabida en la ficha del alumno.')
+
+      const result = await pool.query<{ porcentaje: number; fecha_actualizacion: string }>(`
+        INSERT INTO alumno_forma_progreso (id_alumno, id_forma, porcentaje)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (id_alumno, id_forma)
+        DO UPDATE SET porcentaje = EXCLUDED.porcentaje, fecha_actualizacion = CURRENT_TIMESTAMP
+        RETURNING porcentaje, to_char(fecha_actualizacion, 'YYYY-MM-DD') AS fecha_actualizacion
+      `, [studentId, formId, parsed.data.percent])
+      const row = result.rows[0]!
+      return { studentId: Number(studentId), formId: Number(formId), percent: Number(row.porcentaje), updatedOn: row.fecha_actualizacion }
+    },
+  )
 
   app.get<{ Params: { tableName: string } }>('/tables/:tableName/columns', readLimit, async (request) => {
     const { tableName } = request.params
@@ -504,16 +565,20 @@ export const databaseRoutes: FastifyPluginAsync<DatabaseRoutesOptions> = async (
   app.post<{ Params: { tableName: string }; Body: Row }>('/tables/:tableName/rows', writeLimit, async (request) => {
     const user = requireRole(request, [Roles.ADMIN, Roles.INSTRUCTOR, Roles.USER])
     const { tableName } = request.params
-    assertCanMutate(user, tableName)
+    assertCanMutate(user, tableName, 'create')
     const data = request.body ?? {}
     if (tableName === 'asistencias_curso') assertOwnAttendance(user, data)
     return insertRow(pool, tableName, data)
   })
 
   app.put<{ Params: { tableName: string; id: string }; Body: Row }>('/tables/:tableName/rows/:id', writeLimit, async (request) => {
-    const user = requireRole(request, [Roles.ADMIN])
+    const user = requireRole(request, [Roles.ADMIN, Roles.INSTRUCTOR])
     const { tableName, id } = request.params
-    assertCanMutate(user, tableName)
+    assertCanMutate(user, tableName, 'update')
+    if (user.role === Roles.INSTRUCTOR && tableName === 'alumnos'
+      && Object.keys(request.body ?? {}).some((field) => !instructorStudentEditableFields.has(field))) {
+      throw new ApiError(403, 'El instructor solo puede editar los datos personales y el grado del alumno.')
+    }
     if (tableName === 'administradores') {
       throw new ApiError(403, 'Los administradores pueden crearse y borrarse, pero no editarse.')
     }
@@ -523,7 +588,7 @@ export const databaseRoutes: FastifyPluginAsync<DatabaseRoutesOptions> = async (
   app.delete<{ Params: { tableName: string; id: string } }>('/tables/:tableName/rows/:id', writeLimit, async (request) => {
     const user = requireRole(request, [Roles.ADMIN, Roles.INSTRUCTOR, Roles.USER])
     const { tableName, id } = request.params
-    assertCanMutate(user, tableName)
+    assertCanMutate(user, tableName, 'delete')
 
     if (tableName === 'asistencias_curso') {
       const keys = await primaryKeyColumns(pool, tableName)

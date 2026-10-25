@@ -285,6 +285,15 @@ describe('auth and backwards-compatible database API', () => {
       payload: { password_hash: 'instructor-clave' },
     })
     expect(byInstructor.statusCode).toBe(403)
+    const updatedByInstructor = await app.inject({
+      method: 'PUT',
+      url: `/api/database/tables/alumnos/rows/${studentId}`,
+      headers: authHeaders(instructorCookie),
+      payload: { nombre: 'Alumno actualizado por instructor' },
+    })
+    expect(updatedByInstructor.statusCode).toBe(200)
+    expect(updatedByInstructor.json().nombre).toBe('Alumno actualizado por instructor')
+    await pool.query('UPDATE alumnos SET nombre = $2 WHERE id_alumno = $1', [studentId, 'José Pérez'])
     const createdByInstructor = await app.inject({
       method: 'POST',
       url: '/api/database/tables/alumnos/rows',
@@ -322,6 +331,7 @@ describe('auth and backwards-compatible database API', () => {
     expect(tables.json()).toContain('cursos')
     expect(tables.json()).toContain('salas')
     expect(tables.json()).toContain('horarios_recurrentes')
+    expect(tables.json()).not.toContain('asistencias_curso')
     expect(tables.json()).not.toContain('node_schema_history')
     expect((await app.inject({ method: 'POST', url: '/api/database/migrate', headers: authHeaders(cookie) })).statusCode).toBe(404)
 
@@ -438,7 +448,7 @@ describe('auth and backwards-compatible database API', () => {
     expect(Number(legacySchedule.json().id_sala)).toBe(ids.primaryRoom)
   })
 
-  it('keeps exactly one application administrator account', async () => {
+  it('allows multiple administrator accounts and keeps at least one', async () => {
     const { cookie } = await login('admin@test.invalid')
     const secondAdmin = await app.inject({
       method: 'POST',
@@ -446,20 +456,29 @@ describe('auth and backwards-compatible database API', () => {
       headers: authHeaders(cookie),
       payload: { nombre: 'Segundo admin', correo_electronico: 'admin2@test.invalid', password_hash: 'another-test-password' },
     })
-    expect(secondAdmin.statusCode).toBe(409)
+    expect(secondAdmin.statusCode).toBe(200)
+    expect(secondAdmin.json()).not.toHaveProperty('password_hash')
+    expect((await login('admin2@test.invalid', 'another-test-password')).response.json()).toMatchObject({ role: 'ADMIN' })
 
-    const deleteLastAdmin = await app.inject({
+    const duplicateEmail = await app.inject({
+      method: 'POST',
+      url: '/api/database/tables/administradores/rows',
+      headers: authHeaders(cookie),
+      payload: { nombre: 'Admin duplicado', correo_electronico: 'admin@test.invalid', password_hash: 'another-test-password' },
+    })
+    expect(duplicateEmail.statusCode).toBe(409)
+
+    const deleteSecondAdmin = await app.inject({
       method: 'DELETE',
-      url: `/api/database/tables/administradores/rows/${ids.admin}`,
+      url: `/api/database/tables/administradores/rows/${secondAdmin.json().id_administrador}`,
       headers: authHeaders(cookie),
     })
-    expect(deleteLastAdmin.statusCode).toBe(409)
+    expect(deleteSecondAdmin.statusCode).toBe(200)
 
-    const existingHash = await pool.query<{ password_hash: string }>('SELECT password_hash FROM administradores WHERE id_administrador = $1', [ids.admin])
-    await expect(pool.query(`
-      INSERT INTO administradores (nombre, fecha_inicio, correo_electronico, password_hash)
-      VALUES ('Segundo admin', CURRENT_DATE, 'admin2@test.invalid', $1)
-    `, [existingHash.rows[0]!.password_hash])).rejects.toMatchObject({ code: '23505' })
+    const deleteLastAdmin = await app.inject({
+      method: 'DELETE', url: `/api/database/tables/administradores/rows/${ids.admin}`, headers: authHeaders(cookie),
+    })
+    expect(deleteLastAdmin.statusCode).toBe(409)
   })
 
   it('blocks student writes to generic tables and their access to admin data', async () => {
@@ -481,15 +500,25 @@ describe('auth and backwards-compatible database API', () => {
     })).statusCode).toBe(200)
   })
 
-  it('keeps generic school data admin-only and exposes only calendar-safe instructor details', async () => {
+  it('limits instructor data access to school records and keeps sensitive data private', async () => {
     const { cookie } = await login('instructor@test.invalid')
     const tables = await app.inject({ url: '/api/database/tables', headers: authHeaders(cookie) })
-    expect(tables.statusCode).toBe(403)
+    expect(tables.statusCode).toBe(200)
+    expect(tables.json()).toEqual(expect.arrayContaining([
+      'alumnos', 'cursos', 'formas', 'estilos', 'cursos_agendados', 'horarios_recurrentes',
+    ]))
+    expect(tables.json()).not.toContain('administradores')
     const students = await app.inject({
       url: '/api/database/tables/alumnos/rows?limit=1',
       headers: authHeaders(cookie),
     })
-    expect(students.statusCode).toBe(403)
+    expect(students.statusCode).toBe(200)
+    expect(students.json()[0]).not.toHaveProperty('password_hash')
+    expect((await app.inject({ url: '/api/database/tables/administradores/rows', headers: authHeaders(cookie) })).statusCode).toBe(403)
+    expect((await app.inject({ url: '/api/database/tables/alumno_forma_progreso/rows', headers: authHeaders(cookie) })).statusCode).toBe(403)
+    expect((await app.inject({ method: 'POST', url: '/api/database/tables/alumnos/rows', headers: authHeaders(cookie), payload: {} })).statusCode).toBe(403)
+    expect((await app.inject({ method: 'PUT', url: `/api/database/tables/cursos/rows/${ids.habitualCourse}`, headers: authHeaders(cookie), payload: { nombre: 'No permitido' } })).statusCode).toBe(403)
+    expect((await app.inject({ method: 'DELETE', url: `/api/database/tables/alumnos/rows/${ids.student}`, headers: authHeaders(cookie) })).statusCode).toBe(403)
     const instructors = await app.inject({ url: '/api/calendar/instructors', headers: authHeaders(cookie) })
     expect(instructors.statusCode).toBe(200)
     expect(instructors.json()).toEqual(expect.arrayContaining([
@@ -546,7 +575,7 @@ describe('auth and backwards-compatible database API', () => {
     expect((await app.inject({
       url: `/api/database/students/${ids.student}/known-forms`,
       headers: authHeaders(instructorCookie),
-    })).statusCode).toBe(403)
+    })).statusCode).toBe(200)
 
     // El alumno marca las formas de su grado que está aprendiendo y su avance.
     const otherForm = Number((await pool.query<{ id_forma: number }>(`
@@ -568,9 +597,35 @@ describe('auth and backwards-compatible database API', () => {
       expect.objectContaining({ id: knownForm, known: true, learning: null }),
       expect.objectContaining({ id: pendingForm, known: false, learning: expect.objectContaining({ percent: 75 }) }),
     ])
+    const adminLearningForms = await app.inject({
+      url: `/api/database/students/${ids.student}/learning-forms`,
+      headers: authHeaders(adminCookie),
+    })
+    expect(adminLearningForms.statusCode).toBe(200)
+    expect(adminLearningForms.json()).toEqual([
+      expect.objectContaining({
+        id_alumno: String(ids.student), id_forma: String(pendingForm), nombre: 'Forma perfil pendiente', porcentaje: 75,
+      }),
+    ])
+    const instructorMarkedProgress = await app.inject({
+      method: 'PUT',
+      url: `/api/database/students/${ids.student}/forms/${pendingForm}/progress`,
+      headers: authHeaders(instructorCookie),
+      payload: { percent: 65 },
+    })
+    expect(instructorMarkedProgress.statusCode).toBe(200)
+    expect(instructorMarkedProgress.json()).toMatchObject({ studentId: ids.student, formId: pendingForm, percent: 65 })
     // Cada cuenta solo ve su propio avance.
     expect((await app.inject({ url: '/api/me/profile', headers: authHeaders(instructorCookie) })).json().gradeForms
       .every((form: { learning: unknown }) => form.learning === null)).toBe(true)
+    const instructorLearningForms = await app.inject({
+      url: `/api/database/students/${ids.student}/learning-forms`,
+      headers: authHeaders(instructorCookie),
+    })
+    expect(instructorLearningForms.statusCode).toBe(200)
+    expect(instructorLearningForms.json()).toEqual([
+      expect.objectContaining({ id_forma: String(pendingForm), porcentaje: 65 }),
+    ])
 
     const stopped = await app.inject({ method: 'DELETE', url: `/api/me/forms/${pendingForm}/progress`, headers: authHeaders(studentCookie) })
     expect(stopped.statusCode).toBe(200)
@@ -1071,7 +1126,7 @@ describe('agenda API', () => {
       method: 'POST', url: '/api/calendar/recurring-rules', headers: authHeaders(adminCookie),
       payload: {
         courseId: ids.habitualCourse, instructorId: ids.secondInstructor, roomId: ids.secondRoom,
-        weekdays: [2], startTime: '18:00', endTime: '19:00', startsOn: '2093-03-01', endsOn: null, participantLimit: 1,
+        weekdays: [2, 4], startTime: '18:00', endTime: '19:00', startsOn: '2093-03-01', endsOn: null, participantLimit: 1,
       },
     })
     expect(rule.statusCode).toBe(201)
@@ -1097,6 +1152,7 @@ describe('agenda API', () => {
     expect((await join(bCookie, march[2].id_curso_agendado, { scope: 'occurrence' })).statusCode).toBe(200)
     const series = await join(aCookie, march[0].id_curso_agendado, { scope: 'series' })
     expect(series.statusCode).toBe(200)
+    expect(series.json().joined).toContain(march[1].id_curso_agendado)
     expect(series.json().skipped).toEqual([march[2].fecha_hora.slice(0, 10)])
     expect((await leave(aCookie, march[1].id_curso_agendado, 'occurrence')).statusCode).toBe(200)
 
@@ -1109,7 +1165,7 @@ describe('agenda API', () => {
     // Las fechas generadas más tarde incluyen a quien está apuntado a la serie.
     const july = (await eventsFor(aCookie, '2093-07-01T00:00', '2093-07-31T23:59'))
       .filter((event: { id_horario_recurrente: number }) => Number(event.id_horario_recurrente) === ruleId)
-    expect(july.length).toBeGreaterThanOrEqual(4)
+    expect(july.length).toBeGreaterThanOrEqual(8)
     expect(july.every((event: { mi_participacion: unknown }) => JSON.stringify(event.mi_participacion) === JSON.stringify({ rol: 'ALUMNO', serie: true }))).toBe(true)
 
     const lowered = await app.inject({
@@ -1122,6 +1178,11 @@ describe('agenda API', () => {
       .every((event: { asistentes: unknown; limite_participantes: number }) => event.asistentes === null && event.limite_participantes === 5)).toBe(true)
 
     expect((await leave(aCookie, july[0].id_curso_agendado, 'series')).statusCode).toBe(200)
+    const augustEvents = (await eventsFor(aCookie, '2093-08-01T00:00', '2093-08-31T23:59'))
+      .filter((event: { id_horario_recurrente: number }) => Number(event.id_horario_recurrente) === ruleId ||
+        Number(event.id_horario_recurrente) === Number(march[1].id_horario_recurrente))
+    expect(augustEvents.length).toBeGreaterThan(0)
+    expect(augustEvents.every((event: { mi_participacion: unknown }) => event.mi_participacion === null)).toBe(true)
     const septemberEvents = (await eventsFor(aCookie, '2093-09-01T00:00', '2093-09-30T23:59'))
       .filter((event: { id_horario_recurrente: number }) => Number(event.id_horario_recurrente) === ruleId)
     expect(septemberEvents.length).toBeGreaterThan(0)
