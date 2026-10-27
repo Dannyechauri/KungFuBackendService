@@ -2,7 +2,7 @@ import type { FastifyPluginAsync } from 'fastify'
 import type { Pool } from 'pg'
 import { z } from 'zod'
 
-import { createPerformanceRecord, respondToPerformanceConfirmation } from '../agenda/performance-service.js'
+import { createPerformanceRecord, respondToPerformanceConfirmation, resolvePerformanceAsAdmin } from '../agenda/performance-service.js'
 import { getPerformanceRankings } from '../agenda/performance-ranking-service.js'
 import { ApiError } from '../errors.js'
 import { requireUser, Roles } from '../domain/auth.js'
@@ -32,7 +32,7 @@ function parseId(value: string) {
 export const performanceRoutes: FastifyPluginAsync<PerformanceRoutesOptions> = async (app, { pool }) => {
   app.get('/rankings', readLimit, async (request) => {
     const user = requireUser(request)
-    return getPerformanceRankings(pool, user.studentId)
+    return getPerformanceRankings(pool, user.studentId, user.role === Roles.ADMIN)
   })
 
   app.get('/forms', readLimit, async (request) => {
@@ -95,11 +95,12 @@ export const performanceRoutes: FastifyPluginAsync<PerformanceRoutesOptions> = a
       asistio_clase: boolean
       aprobado_en: string | null
       rechazado_en: string | null
+      resuelto_por_administrador: boolean
       creado_en: string
     }>(`
       SELECT d.id_desempeno::text, d.id_alumno::text, a.nombre,
              to_char(d.fecha, 'YYYY-MM-DD') AS fecha, d.trabajo_fisico, d.trabajo_cardiovascular, d.estiramiento,
-             d.asistio_clase, d.aprobado_en::text, d.rechazado_en::text, d.creado_en::text
+             d.asistio_clase, d.aprobado_en::text, d.rechazado_en::text, d.resuelto_por_administrador, d.creado_en::text
       FROM desempenos_diarios d
       JOIN alumnos a ON a.id_alumno = d.id_alumno
       ${canViewAll ? '' : 'WHERE d.id_alumno = $1'}
@@ -137,6 +138,7 @@ export const performanceRoutes: FastifyPluginAsync<PerformanceRoutesOptions> = a
       attendedClass: record.asistio_clase,
       approvedAt: record.aprobado_en,
       rejectedAt: record.rechazado_en,
+      resolvedByAdmin: record.resuelto_por_administrador,
       forms: forms.rows.filter((form) => form.id_desempeno === record.id_desempeno)
         .map((form) => ({ id: Number(form.id_forma), name: form.forma, style: form.estilo })),
       confirmations: confirmations.rows.filter((confirmation) => confirmation.id_desempeno === record.id_desempeno)
@@ -150,7 +152,8 @@ export const performanceRoutes: FastifyPluginAsync<PerformanceRoutesOptions> = a
 
   app.get('/confirmations/pending', readLimit, async (request) => {
     const user = requireUser(request)
-    if (user.studentId === null) return []
+    const isAdmin = user.role === Roles.ADMIN
+    if (!isAdmin && user.studentId === null) return []
     const result = await pool.query<{
       id_desempeno: string
       nombre: string
@@ -163,12 +166,15 @@ export const performanceRoutes: FastifyPluginAsync<PerformanceRoutesOptions> = a
       SELECT d.id_desempeno::text, owner.nombre,
              to_char(d.fecha, 'YYYY-MM-DD') AS fecha, d.trabajo_fisico, d.trabajo_cardiovascular,
              d.estiramiento, d.asistio_clase
-      FROM desempeno_confirmaciones dc
-      JOIN desempenos_diarios d ON d.id_desempeno = dc.id_desempeno
+      FROM desempenos_diarios d
       JOIN alumnos owner ON owner.id_alumno = d.id_alumno
-      WHERE dc.id_alumno_confirmante = $1 AND dc.estado = 'PENDING'
+      WHERE d.aprobado_en IS NULL AND d.rechazado_en IS NULL
+      ${isAdmin ? '' : `AND EXISTS (
+        SELECT 1 FROM desempeno_confirmaciones dc
+        WHERE dc.id_desempeno = d.id_desempeno AND dc.id_alumno_confirmante = $1 AND dc.estado = 'PENDING'
+      )`}
       ORDER BY d.fecha DESC, d.id_desempeno DESC
-    `, [user.studentId])
+    `, isAdmin ? [] : [user.studentId])
     const ids = result.rows.map((record) => record.id_desempeno)
     const forms = ids.length ? await pool.query<{ id_desempeno: string; nombre: string }>(`
       SELECT df.id_desempeno::text, f.nombre
@@ -230,13 +236,17 @@ export const performanceRoutes: FastifyPluginAsync<PerformanceRoutesOptions> = a
 
   app.post<{ Params: { id: string }; Body: unknown }>('/confirmations/:id/respond', writeLimit, async (request) => {
     const user = requireUser(request)
-    if (user.studentId === null) throw new ApiError(404, 'No se encontró esa solicitud.')
+    const isAdmin = user.role === Roles.ADMIN
+    if (!isAdmin && user.studentId === null) throw new ApiError(404, 'No se encontró esa solicitud.')
     const id = parseId(request.params.id)
     const parsed = confirmationInput.safeParse(request.body)
     if (!parsed.success) throw new ApiError(400, 'Indica si confirmas o rechazas la actividad.')
-    const response = await respondToPerformanceConfirmation(pool, {
+    const response = isAdmin ? await resolvePerformanceAsAdmin(pool, {
       recordId: id,
-      studentId: user.studentId,
+      decision: parsed.data.decision,
+    }) : await respondToPerformanceConfirmation(pool, {
+      recordId: id,
+      studentId: user.studentId!,
       decision: parsed.data.decision,
     })
     if (!response) throw new ApiError(404, 'No se encontró esa solicitud pendiente.')

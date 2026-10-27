@@ -27,18 +27,19 @@ export type PerformanceRankings = {
   overall: RankingEntry[]
 }
 
-function categoryRanking(members: MemberScore[], valueFor: (member: MemberScore) => number, currentStudentId: number | null) {
+function categoryRanking(members: MemberScore[], valueFor: (member: MemberScore) => number, currentStudentId: number | null, includeAll: boolean) {
   const ordered = [...members]
     .map((member) => ({ studentId: member.studentId, name: member.name, points: valueFor(member) }))
     .sort((left, right) => right.points - left.points || left.name.localeCompare(right.name, 'es'))
   const ranked = ordered.map((member, index) => ({ ...member, rank: index + 1 }))
+  if (includeAll) return ranked
   const visible = ranked.slice(0, 3)
   const current = currentStudentId === null ? undefined : ranked.find((entry) => entry.studentId === currentStudentId)
   if (current && current.rank > 3) visible.push(current)
   return visible
 }
 
-export async function getPerformanceRankings(pool: Pool, currentStudentId: number | null): Promise<PerformanceRankings> {
+export async function getPerformanceRankings(pool: Pool, currentStudentId: number | null, includeAll = false): Promise<PerformanceRankings> {
   const [period, result] = await Promise.all([
     pool.query<{ month: string }>(`SELECT to_char(CURRENT_DATE, 'YYYY-MM') AS month`),
     pool.query<{
@@ -80,15 +81,16 @@ export async function getPerformanceRankings(pool: Pool, currentStudentId: numbe
 
   return {
     month: period.rows[0]!.month,
-    attendance: categoryRanking(members, (member) => member.attendance, currentStudentId),
-    stretching: categoryRanking(members, (member) => member.stretching, currentStudentId),
-    strength: categoryRanking(members, (member) => member.strength, currentStudentId),
-    cardio: categoryRanking(members, (member) => member.cardio, currentStudentId),
-    forms: categoryRanking(members, (member) => member.forms, currentStudentId),
+    attendance: categoryRanking(members, (member) => member.attendance, currentStudentId, includeAll),
+    stretching: categoryRanking(members, (member) => member.stretching, currentStudentId, includeAll),
+    strength: categoryRanking(members, (member) => member.strength, currentStudentId, includeAll),
+    cardio: categoryRanking(members, (member) => member.cardio, currentStudentId, includeAll),
+    forms: categoryRanking(members, (member) => member.forms, currentStudentId, includeAll),
     overall: categoryRanking(
       members,
       (member) => member.attendance + member.stretching + member.strength + member.cardio + member.forms,
       currentStudentId,
+      includeAll,
     ),
   }
 }

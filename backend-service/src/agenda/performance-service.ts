@@ -25,6 +25,7 @@ export async function createPerformanceRecord(pool: Pool, input: NewPerformanceR
         asistio_clase = EXCLUDED.asistio_clase,
         aprobado_en = NULL,
         rechazado_en = NULL,
+        resuelto_por_administrador = FALSE,
         creado_en = CURRENT_TIMESTAMP
       RETURNING id_desempeno::text
     `, [input.studentId, input.date, input.physicalWork, input.cardioWork, input.stretching, input.attendedClass])
@@ -68,6 +69,7 @@ export async function respondToPerformanceConfirmation(
       FROM desempenos_diarios d
       JOIN desempeno_confirmaciones dc ON dc.id_desempeno = d.id_desempeno
       WHERE d.id_desempeno = $1 AND dc.id_alumno_confirmante = $2 AND dc.estado = 'PENDING'
+        AND d.aprobado_en IS NULL AND d.rechazado_en IS NULL
       FOR UPDATE OF d
     `, [input.recordId, input.studentId])
     if (!pending.rowCount) {
@@ -121,6 +123,40 @@ export async function respondToPerformanceConfirmation(
 
     await client.query('COMMIT')
     return { status: input.decision, approved, rejected, confirmedCount }
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined)
+    throw error
+  } finally {
+    client.release()
+  }
+}
+
+export async function resolvePerformanceAsAdmin(
+  pool: Pool,
+  input: { recordId: number; decision: 'CONFIRMED' | 'REJECTED' },
+) {
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const updated = await client.query(`
+      UPDATE desempenos_diarios
+      SET aprobado_en = CASE WHEN $2 = 'CONFIRMED' THEN CURRENT_TIMESTAMP ELSE NULL END,
+          rechazado_en = CASE WHEN $2 = 'REJECTED' THEN CURRENT_TIMESTAMP ELSE NULL END,
+          resuelto_por_administrador = TRUE
+      WHERE id_desempeno = $1 AND aprobado_en IS NULL AND rechazado_en IS NULL
+      RETURNING id_desempeno
+    `, [input.recordId, input.decision])
+    if (!updated.rowCount) {
+      await client.query('ROLLBACK')
+      return null
+    }
+    await client.query(`
+      UPDATE desempeno_confirmaciones
+      SET estado = 'NOT_REQUIRED', respondido_en = CURRENT_TIMESTAMP
+      WHERE id_desempeno = $1 AND estado = 'PENDING'
+    `, [input.recordId])
+    await client.query('COMMIT')
+    return { status: input.decision, approved: input.decision === 'CONFIRMED', rejected: input.decision === 'REJECTED', resolvedByAdmin: true }
   } catch (error) {
     await client.query('ROLLBACK').catch(() => undefined)
     throw error

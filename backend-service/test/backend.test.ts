@@ -947,6 +947,16 @@ describe('daily performance API', () => {
     expect(rankings.forms[0]).toMatchObject({ studentId: rankingMembers[0], points: 2 })
     expect(rankings.overall[0]).toMatchObject({ studentId: rankingMembers[0], points: 6 })
     expect(rankings.overall[3]).toMatchObject({ studentId: ids.student, points: currentScore.rows[0]!.points })
+    const adminRankings = await app.inject({ url: '/api/performance/rankings', headers: authHeaders(latestAdminCookie) })
+    expect(adminRankings.statusCode).toBe(200)
+    const activeStudents = await pool.query<{ id_alumno: number }>('SELECT id_alumno FROM alumnos WHERE activo = TRUE')
+    for (const category of ['attendance', 'stretching', 'strength', 'cardio', 'forms', 'overall']) {
+      const entries = adminRankings.json()[category] as { rank: number; studentId: number }[]
+      expect(entries).toHaveLength(activeStudents.rowCount!)
+      expect(entries.map(({ studentId }) => studentId).sort((left, right) => left - right))
+        .toEqual(activeStudents.rows.map(({ id_alumno }) => Number(id_alumno)).sort((left, right) => left - right))
+      expect(entries.map(({ rank }) => rank)).toEqual(entries.map((_, index) => index + 1))
+    }
   })
 
   it('rejects the record when two confirmations can no longer be reached', async () => {
@@ -997,6 +1007,61 @@ describe('daily performance API', () => {
     expect(records.json()).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: recordId, approvedAt: null, rejectedAt: expect.any(String) }),
     ]))
+  })
+})
+
+describe('administrative performance resolution', () => {
+  let studentCookie: string | undefined
+  let instructorCookie: string | undefined
+  let secondInstructorCookie: string | undefined
+  beforeAll(async () => {
+    studentCookie = (await login('student@test.invalid')).cookie
+    instructorCookie = (await login('instructor@test.invalid')).cookie
+    secondInstructorCookie = (await login('instructor2@test.invalid')).cookie
+  })
+
+  it.each(['CONFIRMED', 'REJECTED'] as const)('resolves an open request as %s without waiting for witnesses', async (decision) => {
+    const adminCookie = latestAdminCookie ?? (await login('admin@test.invalid')).cookie
+    const payload = {
+      date: decision === 'CONFIRMED' ? '2093-03-01' : '2093-03-02',
+      physicalWork: true, cardioWork: false, stretching: false, attendedClass: false,
+      formIds: [], confirmerIds: [ids.instructorStudent, ids.secondInstructorStudent],
+    }
+    const created = await app.inject({ method: 'POST', url: '/api/performance/records', headers: authHeaders(studentCookie), payload })
+    expect(created.statusCode).toBe(201)
+    const recordId = created.json().id
+    const url = `/api/performance/confirmations/${recordId}/respond`
+    expect((await app.inject({ method: 'POST', url, payload: { decision } })).statusCode).toBe(401)
+    expect((await app.inject({ method: 'POST', url, headers: authHeaders(studentCookie), payload: { decision } })).statusCode).toBe(404)
+    const pending = await app.inject({ url: '/api/performance/confirmations/pending', headers: authHeaders(adminCookie) })
+    expect(pending.json()).toEqual(expect.arrayContaining([expect.objectContaining({ id: recordId })]))
+    if (decision === 'REJECTED') {
+      const witness = await app.inject({ method: 'POST', url, headers: authHeaders(instructorCookie), payload: { decision: 'CONFIRMED' } })
+      expect(witness.json()).toMatchObject({ approved: false, confirmedCount: 1 })
+    }
+    const resolved = await app.inject({ method: 'POST', url, headers: authHeaders(adminCookie), payload: { decision } })
+    expect(resolved.statusCode).toBe(200)
+    expect(resolved.json()).toMatchObject({ approved: decision === 'CONFIRMED', rejected: decision === 'REJECTED', resolvedByAdmin: true })
+    for (const cookie of [studentCookie, instructorCookie, adminCookie]) {
+      const records = await app.inject({ url: '/api/performance/records', headers: authHeaders(cookie) })
+      expect(records.json()).toEqual(expect.arrayContaining([expect.objectContaining({
+        id: recordId, resolvedByAdmin: true,
+        approvedAt: decision === 'CONFIRMED' ? expect.any(String) : null,
+        rejectedAt: decision === 'REJECTED' ? expect.any(String) : null,
+      })]))
+    }
+    for (const cookie of [adminCookie, instructorCookie, secondInstructorCookie]) {
+      const inbox = await app.inject({ url: '/api/performance/confirmations/pending', headers: authHeaders(cookie) })
+      expect(inbox.json()).not.toEqual(expect.arrayContaining([expect.objectContaining({ id: recordId })]))
+      expect((await app.inject({ method: 'POST', url, headers: authHeaders(cookie), payload: { decision: 'CONFIRMED' } })).statusCode).toBe(404)
+    }
+    const replacement = await app.inject({ method: 'POST', url: '/api/performance/records', headers: authHeaders(studentCookie), payload })
+    expect(replacement.json()).toEqual({ id: recordId })
+    const resetRecords = await app.inject({ url: '/api/performance/records', headers: authHeaders(studentCookie) })
+    expect(resetRecords.json()).toEqual(expect.arrayContaining([expect.objectContaining({
+      id: recordId, resolvedByAdmin: false, approvedAt: null, rejectedAt: null,
+      confirmations: expect.arrayContaining([expect.objectContaining({ status: 'PENDING' })]),
+    })]))
   })
 })
 
@@ -1713,7 +1778,7 @@ describe('database migration runner', () => {
       await legacyPool.query('INSERT INTO flyway_schema_history (installed_rank, version, success) VALUES (12, $1, TRUE)', ['12'])
 
       const result = await migrateDatabase(legacyPool)
-      expect(result.migrationsExecuted).toBe(14)
+      expect(result.migrationsExecuted).toBe(15)
       const converted = await legacyPool.query(`
         SELECT a.numero_matricula, a.correo_electronico, a.es_instructor, a.password_hash
         FROM instructores i JOIN alumnos a ON a.id_alumno = i.id_alumno
