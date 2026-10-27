@@ -14,6 +14,7 @@ import { authRoutes } from './routes/auth.js'
 import { databaseRoutes } from './routes/database.js'
 import { calendarRoutes } from './routes/calendar.js'
 import { meRoutes } from './routes/me.js'
+import { performanceRoutes } from './routes/performance.js'
 
 type AppOptions = { pool: Pool; runMigrations?: boolean; logger?: boolean }
 
@@ -124,6 +125,7 @@ export async function createApp({ pool, runMigrations = config.nodeEnv !== 'prod
   await app.register(databaseRoutes, { prefix: '/api/database', pool })
   await app.register(calendarRoutes, { prefix: '/api/calendar', pool })
   await app.register(meRoutes, { prefix: '/api/me', pool })
+  await app.register(performanceRoutes, { prefix: '/api/performance', pool })
 
   return app
 }

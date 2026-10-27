@@ -18,7 +18,7 @@ const localHosts = new Set(['localhost', '127.0.0.1', '::1'])
 let adminUrl!: URL
 let pool!: ReturnType<typeof createPool>
 let app!: Awaited<ReturnType<typeof createApp>>
-let ids: { admin: number; instructor: number; instructorStudent: number; student: number; grade: number; habitualCourse: number; specialCourse: number; secondInstructor: number; primaryRoom: number; secondRoom: number; style: number }
+let ids: { admin: number; instructor: number; instructorStudent: number; student: number; grade: number; habitualCourse: number; specialCourse: number; secondInstructor: number; secondInstructorStudent: number; primaryRoom: number; secondRoom: number; style: number }
 
 function quoteDatabaseName(name: string) {
   if (!/^kungfu_node_test_\d+_[a-f0-9]+$/u.test(name)) throw new Error('Refusing to touch a database outside the backend test naming scheme.')
@@ -112,6 +112,7 @@ async function seedAccountsAndCourses() {
     student: Number(student.rows[0]!.id_alumno),
     habitualCourse: Number(habitual.rows[0]!.id_curso),
     specialCourse: Number(special.rows[0]!.id_curso),
+    secondInstructorStudent: secondInstructor.studentId,
     primaryRoom: Number(primaryRoom.rows[0]!.id_sala),
     secondRoom: Number(secondRoom.rows[0]!.id_sala),
     style: Number(style.rows[0]!.id_estilo),
@@ -692,6 +693,310 @@ describe('auth and backwards-compatible database API', () => {
       payload: { id_curso_agendado: event.json().id_curso_agendado, id_instructor: ids.secondInstructor },
     })
     expect(asOtherInstructor.statusCode).toBe(403)
+  })
+})
+
+describe('daily performance API', () => {
+  it('creates a daily record, requires the selected witnesses, and enforces private history', async () => {
+    const form = await pool.query<{ id_forma: number }>(`
+      INSERT INTO formas (id_estilo, nombre) VALUES ($1, 'Forma desempeño test') RETURNING id_forma
+    `, [ids.style])
+    const formId = Number(form.rows[0]!.id_forma)
+    const gradeForm = Number((await pool.query<{ id_forma: number }>(`
+      INSERT INTO formas (id_estilo, nombre) VALUES ($1, 'Forma grado desempeño test') RETURNING id_forma
+    `, [ids.style])).rows[0]!.id_forma)
+    const knownForm = Number((await pool.query<{ id_forma: number }>(`
+      INSERT INTO formas (id_estilo, nombre) VALUES ($1, 'Forma sabida desempeño test') RETURNING id_forma
+    `, [ids.style])).rows[0]!.id_forma)
+    await pool.query('INSERT INTO grado_forma (id_grado, id_forma) VALUES ($1, $2)', [ids.grade, gradeForm])
+    await pool.query('INSERT INTO alumno_forma (id_alumno, id_forma, fecha_aprendida) VALUES ($1, $2, CURRENT_DATE)', [ids.student, knownForm])
+    const extraWitness = await pool.query<{ id_alumno: number }>(`
+      INSERT INTO alumnos (numero_matricula, fecha_ingreso, activo, fecha_nacimiento, id_grado, correo_electronico, password_hash, nombre)
+      VALUES ('TEST-WIT-3', CURRENT_DATE, TRUE, DATE '2000-01-03', $1, 'witness3@test.invalid', $2, 'Testigo extra')
+      RETURNING id_alumno
+    `, [ids.grade, await bcrypt.hash('test-password-123', 4)])
+    const extraWitnessId = Number(extraWitness.rows[0]!.id_alumno)
+    const { cookie: studentCookie } = await login('student@test.invalid')
+    const suggestedForms = await app.inject({ url: '/api/performance/forms', headers: authHeaders(studentCookie) })
+    expect(suggestedForms.json()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: gradeForm, inCurrentGrade: true, known: false }),
+      expect.objectContaining({ id: knownForm, inCurrentGrade: false, known: true }),
+      expect.objectContaining({ id: formId, inCurrentGrade: false, known: false }),
+    ]))
+    expect((await app.inject({ url: '/api/performance/confirmers', headers: authHeaders(studentCookie) })).json()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: ids.instructorStudent, name: 'Instructor test' }),
+      expect.objectContaining({ id: ids.secondInstructorStudent, name: 'Instructor dos' }),
+    ]))
+
+    const payload = {
+      date: '2093-02-14',
+      physicalWork: true,
+      cardioWork: true,
+      stretching: true,
+      attendedClass: true,
+      formIds: [formId],
+      confirmerIds: [ids.instructorStudent, ids.secondInstructorStudent, extraWitnessId],
+    }
+
+    expect((await app.inject({ method: 'POST', url: '/api/performance/records', payload })).statusCode).toBe(401)
+    const created = await app.inject({
+      method: 'POST', url: '/api/performance/records', headers: authHeaders(studentCookie), payload,
+    })
+    expect(created.statusCode).toBe(201)
+    const recordId = created.json().id
+
+    const replacement = await app.inject({
+      method: 'POST',
+      url: '/api/performance/records',
+      headers: authHeaders(studentCookie),
+      payload: {
+        ...payload,
+        physicalWork: false,
+        cardioWork: false,
+        stretching: false,
+        attendedClass: false,
+        formIds: [gradeForm],
+      },
+    })
+    expect(replacement.statusCode).toBe(201)
+    expect(replacement.json()).toEqual({ id: recordId })
+
+    const studentRecords = await app.inject({ url: '/api/performance/records?studentId=999999', headers: authHeaders(studentCookie) })
+    expect(studentRecords.statusCode).toBe(200)
+    expect(studentRecords.json()).toEqual([
+      expect.objectContaining({
+        id: recordId,
+        studentName: 'Alumno test',
+        date: payload.date,
+        physicalWork: false,
+        cardioWork: false,
+        stretching: false,
+        attendedClass: false,
+        forms: [expect.objectContaining({ id: gradeForm, name: 'Forma grado desempeño test' })],
+        confirmations: expect.arrayContaining([
+          expect.objectContaining({ studentId: ids.instructorStudent, status: 'PENDING' }),
+          expect.objectContaining({ studentId: ids.secondInstructorStudent, status: 'PENDING' }),
+        ]),
+      }),
+    ])
+
+    const forbiddenResponse = await app.inject({
+      method: 'POST',
+      url: `/api/performance/confirmations/${recordId}/respond`,
+      headers: authHeaders(studentCookie),
+      payload: { decision: 'CONFIRMED' },
+    })
+    expect(forbiddenResponse.statusCode).toBe(404)
+
+    const { cookie: instructorCookie } = await login('instructor@test.invalid')
+    const inbox = await app.inject({ url: '/api/performance/confirmations/pending', headers: authHeaders(instructorCookie) })
+    expect(inbox.json()).toEqual([expect.objectContaining({ id: recordId, studentName: 'Alumno test', forms: ['Forma grado desempeño test'] })])
+    const instructorRecords = await app.inject({ url: '/api/performance/records', headers: authHeaders(instructorCookie) })
+    expect(instructorRecords.json()).toEqual(expect.arrayContaining([expect.objectContaining({ id: recordId, studentName: 'Alumno test' })]))
+    const confirmed = await app.inject({
+      method: 'POST',
+      url: `/api/performance/confirmations/${recordId}/respond`,
+      headers: authHeaders(instructorCookie),
+      payload: { decision: 'CONFIRMED' },
+    })
+    expect(confirmed.statusCode).toBe(200)
+    expect(confirmed.json()).toMatchObject({ approved: false, confirmedCount: 1 })
+    const { cookie: extraWitnessCookie } = await login('witness3@test.invalid')
+    const extraInboxBeforeApproval = await app.inject({ url: '/api/performance/confirmations/pending', headers: authHeaders(extraWitnessCookie) })
+    expect(extraInboxBeforeApproval.json()).toHaveLength(1)
+
+    const { cookie: secondInstructorCookie } = await login('instructor2@test.invalid')
+    const secondConfirmed = await app.inject({
+      method: 'POST',
+      url: `/api/performance/confirmations/${recordId}/respond`,
+      headers: authHeaders(secondInstructorCookie),
+      payload: { decision: 'CONFIRMED' },
+    })
+    expect(secondConfirmed.statusCode).toBe(200)
+    expect(secondConfirmed.json()).toMatchObject({ approved: true, confirmedCount: 2 })
+    expect((await app.inject({ url: '/api/performance/confirmations/pending', headers: authHeaders(extraWitnessCookie) })).json()).toEqual([])
+    const noLongerRequired = await app.inject({
+      method: 'POST',
+      url: `/api/performance/confirmations/${recordId}/respond`,
+      headers: authHeaders(extraWitnessCookie),
+      payload: { decision: 'CONFIRMED' },
+    })
+    expect(noLongerRequired.statusCode).toBe(404)
+
+    const { cookie: adminCookie } = await login('admin@test.invalid')
+    const adminRecords = await app.inject({ url: '/api/performance/records', headers: authHeaders(adminCookie) })
+    expect(adminRecords.json()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: recordId, approvedAt: expect.any(String), confirmations: expect.arrayContaining([
+        expect.objectContaining({ status: 'CONFIRMED' }),
+        expect.objectContaining({ studentId: extraWitnessId, status: 'NOT_REQUIRED' }),
+      ]) }),
+    ]))
+    expect((await app.inject({
+      method: 'POST', url: '/api/performance/records', headers: authHeaders(adminCookie), payload,
+    })).statusCode).toBe(403)
+  })
+
+  it('requires at least two distinct active confirmers', async () => {
+    const { cookie } = await login('student@test.invalid')
+    const onlyOne = await app.inject({
+      method: 'POST',
+      url: '/api/performance/records',
+      headers: authHeaders(cookie),
+      payload: {
+        date: '2093-02-16',
+        physicalWork: true,
+        cardioWork: false,
+        stretching: false,
+        attendedClass: false,
+        formIds: [],
+        confirmerIds: [ids.instructorStudent],
+      },
+    })
+    expect(onlyOne.statusCode).toBe(400)
+    const invalid = await app.inject({
+      method: 'POST',
+      url: '/api/performance/records',
+      headers: authHeaders(cookie),
+      payload: {
+        date: '2093-02-15',
+        physicalWork: true,
+        cardioWork: false,
+        stretching: false,
+        attendedClass: false,
+        formIds: [],
+        confirmerIds: [ids.student, ids.student],
+      },
+    })
+    expect(invalid.statusCode).toBe(400)
+  })
+
+  it('ranks approved activity by category and appends the current student after third place', async () => {
+    const rankingMembers: number[] = []
+    const passwordHash = await bcrypt.hash('test-password-123', 4)
+    for (const rankNumber of [1, 2, 3]) {
+      const student = await pool.query<{ id_alumno: number }>(`
+        INSERT INTO alumnos (numero_matricula, fecha_ingreso, activo, fecha_nacimiento, id_grado, correo_electronico, password_hash, nombre)
+        VALUES ($1, CURRENT_DATE, TRUE, DATE '2000-02-01', $2, $3, $4, $5)
+        RETURNING id_alumno
+      `, [
+        `TEST-RANK-${rankNumber}`,
+        ids.grade,
+        `rank${rankNumber}@test.invalid`,
+        passwordHash,
+        `Ranking miembro ${rankNumber}`,
+      ])
+      const studentId = Number(student.rows[0]!.id_alumno)
+      rankingMembers.push(studentId)
+      const record = await pool.query<{ id_desempeno: number }>(`
+        INSERT INTO desempenos_diarios (
+          id_alumno, fecha, trabajo_fisico, trabajo_cardiovascular, estiramiento, asistio_clase, aprobado_en
+        )
+        VALUES ($1, date_trunc('month', CURRENT_DATE)::date + ($2::int - 1), TRUE, TRUE, TRUE, TRUE, CURRENT_TIMESTAMP)
+        RETURNING id_desempeno
+      `, [studentId, rankNumber])
+      if (rankNumber === 1) {
+        const previousMonthRecord = await pool.query<{ id_desempeno: number }>(`
+          INSERT INTO desempenos_diarios (
+            id_alumno, fecha, trabajo_fisico, trabajo_cardiovascular, estiramiento, asistio_clase, aprobado_en
+          )
+          VALUES ($1, date_trunc('month', CURRENT_DATE)::date - 1, TRUE, TRUE, TRUE, TRUE, CURRENT_TIMESTAMP)
+          RETURNING id_desempeno
+        `, [studentId])
+        const forms = await pool.query<{ id_forma: number }>(`
+          INSERT INTO formas (id_estilo, nombre)
+          VALUES ($1, 'Ranking forma uno'), ($1, 'Ranking forma dos')
+          RETURNING id_forma
+        `, [ids.style])
+        await pool.query(`
+          INSERT INTO desempeno_formas (id_desempeno, id_forma)
+          SELECT record_ids.id_desempeno, form_ids.id_forma
+          FROM unnest($1::bigint[]) AS record_ids(id_desempeno)
+          CROSS JOIN unnest($2::bigint[]) AS form_ids(id_forma)
+        `, [
+          [record.rows[0]!.id_desempeno, previousMonthRecord.rows[0]!.id_desempeno],
+          forms.rows.map(({ id_forma }) => id_forma),
+        ])
+      }
+    }
+
+    expect((await app.inject({ url: '/api/performance/rankings' })).statusCode).toBe(401)
+    const { cookie } = await login('student@test.invalid')
+    const response = await app.inject({ url: '/api/performance/rankings', headers: authHeaders(cookie) })
+    expect(response.statusCode).toBe(200)
+    const currentScore = await pool.query<{ points: number }>(`
+      SELECT (
+          (SELECT COUNT(*) FROM desempenos_diarios d WHERE d.id_alumno = $1 AND d.aprobado_en IS NOT NULL AND d.rechazado_en IS NULL AND d.fecha >= date_trunc('month', CURRENT_DATE)::date AND d.fecha < (date_trunc('month', CURRENT_DATE) + INTERVAL '1 month')::date AND d.asistio_clase)
+          + (SELECT COUNT(*) FROM desempenos_diarios d WHERE d.id_alumno = $1 AND d.aprobado_en IS NOT NULL AND d.rechazado_en IS NULL AND d.fecha >= date_trunc('month', CURRENT_DATE)::date AND d.fecha < (date_trunc('month', CURRENT_DATE) + INTERVAL '1 month')::date AND d.estiramiento)
+          + (SELECT COUNT(*) FROM desempenos_diarios d WHERE d.id_alumno = $1 AND d.aprobado_en IS NOT NULL AND d.rechazado_en IS NULL AND d.fecha >= date_trunc('month', CURRENT_DATE)::date AND d.fecha < (date_trunc('month', CURRENT_DATE) + INTERVAL '1 month')::date AND d.trabajo_fisico)
+          + (SELECT COUNT(*) FROM desempenos_diarios d WHERE d.id_alumno = $1 AND d.aprobado_en IS NOT NULL AND d.rechazado_en IS NULL AND d.fecha >= date_trunc('month', CURRENT_DATE)::date AND d.fecha < (date_trunc('month', CURRENT_DATE) + INTERVAL '1 month')::date AND d.trabajo_cardiovascular)
+        + (SELECT COUNT(*) FROM desempeno_formas df JOIN desempenos_diarios d USING (id_desempeno)
+            WHERE d.id_alumno = $1 AND d.aprobado_en IS NOT NULL AND d.rechazado_en IS NULL AND d.fecha >= date_trunc('month', CURRENT_DATE)::date AND d.fecha < (date_trunc('month', CURRENT_DATE) + INTERVAL '1 month')::date)
+      )::int AS points
+    `, [ids.student])
+    const rankings = response.json()
+    expect(Object.keys(rankings)).toEqual(expect.arrayContaining([
+      'attendance', 'stretching', 'strength', 'cardio', 'forms', 'overall',
+    ]))
+    expect(rankings.attendance.slice(0, 3).map((entry: { studentId: number; points: number }) => entry.studentId))
+      .toEqual(expect.arrayContaining(rankingMembers))
+    expect(rankings.attendance).toHaveLength(4)
+    expect(rankings.attendance[3]).toMatchObject({ studentId: ids.student, points: 0 })
+    expect(rankings.strength[0]).toMatchObject({ studentId: rankingMembers[0], points: 1 })
+    expect(rankings.cardio[0]).toMatchObject({ studentId: rankingMembers[0], points: 1 })
+    expect(rankings.stretching[0]).toMatchObject({ studentId: rankingMembers[0], points: 1 })
+    expect(rankings.forms[0]).toMatchObject({ studentId: rankingMembers[0], points: 2 })
+    expect(rankings.overall[0]).toMatchObject({ studentId: rankingMembers[0], points: 6 })
+    expect(rankings.overall[3]).toMatchObject({ studentId: ids.student, points: currentScore.rows[0]!.points })
+  })
+
+  it('rejects the record when two confirmations can no longer be reached', async () => {
+    const extraWitness = await pool.query<{ id_alumno: number }>(`
+      INSERT INTO alumnos (numero_matricula, fecha_ingreso, activo, fecha_nacimiento, id_grado, correo_electronico, password_hash, nombre)
+      VALUES ('TEST-WIT-4', CURRENT_DATE, TRUE, DATE '2000-01-04', $1, 'witness4@test.invalid', $2, 'Otro testigo')
+      RETURNING id_alumno
+    `, [ids.grade, await bcrypt.hash('test-password-123', 4)])
+    const extraWitnessId = Number(extraWitness.rows[0]!.id_alumno)
+    const { cookie: studentCookie } = await login('student@test.invalid')
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/performance/records',
+      headers: authHeaders(studentCookie),
+      payload: {
+        date: '2093-02-17',
+        physicalWork: true,
+        cardioWork: false,
+        stretching: false,
+        attendedClass: false,
+        formIds: [],
+        confirmerIds: [ids.instructorStudent, ids.secondInstructorStudent, extraWitnessId],
+      },
+    })
+    expect(created.statusCode).toBe(201)
+    const recordId = created.json().id
+    const { cookie: instructorCookie } = await login('instructor@test.invalid')
+    const firstReject = await app.inject({
+      method: 'POST',
+      url: `/api/performance/confirmations/${recordId}/respond`,
+      headers: authHeaders(instructorCookie),
+      payload: { decision: 'REJECTED' },
+    })
+    expect(firstReject.json()).toMatchObject({ approved: false, rejected: false })
+
+    const { cookie: secondInstructorCookie } = await login('instructor2@test.invalid')
+    const quorumLost = await app.inject({
+      method: 'POST',
+      url: `/api/performance/confirmations/${recordId}/respond`,
+      headers: authHeaders(secondInstructorCookie),
+      payload: { decision: 'REJECTED' },
+    })
+    expect(quorumLost.json()).toMatchObject({ approved: false, rejected: true, confirmedCount: 0 })
+
+    const { cookie: extraWitnessCookie } = await login('witness4@test.invalid')
+    expect((await app.inject({ url: '/api/performance/confirmations/pending', headers: authHeaders(extraWitnessCookie) })).json()).toEqual([])
+    const records = await app.inject({ url: '/api/performance/records', headers: authHeaders(studentCookie) })
+    expect(records.json()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: recordId, approvedAt: null, rejectedAt: expect.any(String) }),
+    ]))
   })
 })
 
@@ -1408,7 +1713,7 @@ describe('database migration runner', () => {
       await legacyPool.query('INSERT INTO flyway_schema_history (installed_rank, version, success) VALUES (12, $1, TRUE)', ['12'])
 
       const result = await migrateDatabase(legacyPool)
-      expect(result.migrationsExecuted).toBe(9)
+      expect(result.migrationsExecuted).toBe(14)
       const converted = await legacyPool.query(`
         SELECT a.numero_matricula, a.correo_electronico, a.es_instructor, a.password_hash
         FROM instructores i JOIN alumnos a ON a.id_alumno = i.id_alumno
