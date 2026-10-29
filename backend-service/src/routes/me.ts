@@ -26,6 +26,19 @@ function requireStudentId(request: Parameters<typeof requireUser>[0]) {
 
 /** Ficha propia de alumnos e instructores; siempre se resuelve desde la sesión, nunca por parámetro. */
 export const meRoutes: FastifyPluginAsync<MeRoutesOptions> = async (app, { pool }) => {
+  app.get('/birthdays/today', readLimit, async (request) => {
+    requireUser(request)
+    const result = await pool.query<{ id_alumno: string; nombre: string }>(`
+      SELECT id_alumno::text, nombre
+      FROM alumnos
+      WHERE activo = TRUE
+        AND EXTRACT(MONTH FROM fecha_nacimiento) = EXTRACT(MONTH FROM CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Madrid')
+        AND EXTRACT(DAY FROM fecha_nacimiento) = EXTRACT(DAY FROM CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Madrid')
+      ORDER BY nombre
+    `)
+    return result.rows.map((row) => ({ id: Number(row.id_alumno), name: row.nombre }))
+  })
+
   app.get('/profile', readLimit, async (request) => {
     const user = requireUser(request)
     if (user.studentId === null) throw new ApiError(404, 'Esta cuenta no tiene ficha de alumno')

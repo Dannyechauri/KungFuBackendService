@@ -31,8 +31,8 @@ type TableColumnInfo = {
 
 const identifierPattern = /^[a-zA-Z_][a-zA-Z0-9_]*$/u
 const internalTables = new Set(['api_sessions', 'flyway_schema_history', 'node_schema_history'])
-const unlistedTables = new Set(['asistencias_curso'])
-const blockedAllMutationTables = new Set(['api_sessions', 'flyway_schema_history', 'node_schema_history'])
+const unlistedTables = new Set(['alumno_comentarios', 'asistencias_curso'])
+const blockedAllMutationTables = new Set(['alumno_comentarios', 'api_sessions', 'flyway_schema_history', 'node_schema_history'])
 const selfServiceTables = new Set(['asistencias_curso'])
 const passwordTables = new Set(['alumnos', 'administradores'])
 const instructorVisibleTables = new Set(['alumnos', 'cursos', 'formas', 'estilos', 'cursos_agendados', 'horarios_recurrentes'])
@@ -40,10 +40,8 @@ const instructorReadableTables = new Set([
   ...instructorVisibleTables,
   'grado_forma', 'grados', 'instructores', 'salas',
 ])
-const instructorStudentEditableFields = new Set([
-  'nombre', 'numero_matricula', 'fecha_nacimiento', 'fecha_ingreso', 'correo_electronico', 'id_grado',
-])
 const progressInput = z.object({ percent: z.number().int().min(0).max(100) }).strict()
+const studentCommentInput = z.object({ comment: z.string().trim().min(1).max(4000) }).strict()
 
 function quoteIdentifier(value: string) {
   if (!identifierPattern.test(value)) throw new ApiError(400, 'Nombre de tabla o columna inválido.')
@@ -207,7 +205,6 @@ function assertCanRead(user: SessionUser | null, tableName: string) {
 function assertCanMutate(user: SessionUser, tableName: string, operation: 'create' | 'update' | 'delete') {
   if (blockedAllMutationTables.has(tableName)) throw new ApiError(403, 'No se permite modificar esta tabla.')
   if (user.role === Roles.ADMIN) return
-  if (user.role === Roles.INSTRUCTOR && operation === 'update' && tableName === 'alumnos') return
   if (operation !== 'update' && selfServiceTables.has(tableName)) return
   throw new ApiError(403, 'No tiene permisos para modificar estos datos.')
 }
@@ -476,6 +473,84 @@ export const databaseRoutes: FastifyPluginAsync<DatabaseRoutesOptions> = async (
     return names
   })
 
+  app.get<{ Params: { studentId: string } }>('/students/:studentId/comments', readLimit, async (request) => {
+    requireRole(request, [Roles.ADMIN, Roles.INSTRUCTOR])
+    const [studentId] = parsePrimaryKeyValues(request.params.studentId, 1)
+    const student = await pool.query('SELECT 1 FROM alumnos WHERE id_alumno = $1', [studentId])
+    if (!student.rows[0]) throw new ApiError(404, 'No se encontró el alumno.')
+    const result = await pool.query<{
+      id_comentario: string
+      id_autor: string
+      nombre_autor: string
+      rol_autor: 'ADMIN' | 'INSTRUCTOR'
+      comentario: string
+      creado_en: Date
+    }>(`
+      SELECT id_comentario::text, id_autor::text, nombre_autor, rol_autor, comentario, creado_en
+      FROM alumno_comentarios
+      WHERE id_alumno = $1
+      ORDER BY creado_en DESC, id_comentario DESC
+    `, [studentId])
+    return result.rows.map((row) => ({
+      id: Number(row.id_comentario),
+      authorId: Number(row.id_autor),
+      author: row.nombre_autor,
+      role: row.rol_autor,
+      comment: row.comentario,
+      createdAt: row.creado_en.toISOString(),
+    }))
+  })
+
+  app.post<{ Params: { studentId: string }; Body: unknown }>('/students/:studentId/comments', writeLimit, async (request) => {
+    const author = requireRole(request, [Roles.ADMIN, Roles.INSTRUCTOR])
+    const [studentId] = parsePrimaryKeyValues(request.params.studentId, 1)
+    const parsed = studentCommentInput.safeParse(request.body ?? {})
+    if (!parsed.success) throw new ApiError(400, 'El comentario debe tener entre 1 y 4000 caracteres.')
+    const student = await pool.query('SELECT 1 FROM alumnos WHERE id_alumno = $1', [studentId])
+    if (!student.rows[0]) throw new ApiError(404, 'No se encontró el alumno.')
+    const result = await pool.query<{
+      id_comentario: string
+      id_autor: string
+      nombre_autor: string
+      rol_autor: 'ADMIN' | 'INSTRUCTOR'
+      comentario: string
+      creado_en: Date
+    }>(`
+      INSERT INTO alumno_comentarios (id_alumno, id_autor, rol_autor, nombre_autor, comentario)
+      VALUES ($1, $2, $3, $4, $5)
+      RETURNING id_comentario::text, id_autor::text, nombre_autor, rol_autor, comentario, creado_en
+    `, [studentId, author.userId, author.role, author.displayName, parsed.data.comment])
+    const row = result.rows[0]!
+    return {
+      id: Number(row.id_comentario),
+      authorId: Number(row.id_autor),
+      author: row.nombre_autor,
+      role: row.rol_autor,
+      comment: row.comentario,
+      createdAt: row.creado_en.toISOString(),
+    }
+  })
+
+  app.delete<{ Params: { studentId: string; commentId: string } }>(
+    '/students/:studentId/comments/:commentId', writeLimit, async (request) => {
+      const user = requireRole(request, [Roles.ADMIN, Roles.INSTRUCTOR])
+      const [studentId] = parsePrimaryKeyValues(request.params.studentId, 1)
+      const [commentId] = parsePrimaryKeyValues(request.params.commentId, 1)
+      const existing = await pool.query<{ id_autor: string; rol_autor: 'ADMIN' | 'INSTRUCTOR' }>(`
+        SELECT id_autor::text, rol_autor
+        FROM alumno_comentarios
+        WHERE id_comentario = $1 AND id_alumno = $2
+      `, [commentId, studentId])
+      const comment = existing.rows[0]
+      if (!comment) throw new ApiError(404, 'No se encontró el comentario.')
+      if (user.role !== Roles.ADMIN && (comment.rol_autor !== user.role || Number(comment.id_autor) !== user.userId)) {
+        throw new ApiError(403, 'Solo puede borrar sus propios comentarios.')
+      }
+      await pool.query('DELETE FROM alumno_comentarios WHERE id_comentario = $1 AND id_alumno = $2', [commentId, studentId])
+      return { deleted: true }
+    },
+  )
+
   app.get<{ Params: { studentId: string } }>('/students/:studentId/known-forms', readLimit, async (request) => {
     requireRole(request, [Roles.ADMIN, Roles.INSTRUCTOR])
     const [studentId] = parsePrimaryKeyValues(request.params.studentId, 1)
@@ -575,10 +650,6 @@ export const databaseRoutes: FastifyPluginAsync<DatabaseRoutesOptions> = async (
     const user = requireRole(request, [Roles.ADMIN, Roles.INSTRUCTOR])
     const { tableName, id } = request.params
     assertCanMutate(user, tableName, 'update')
-    if (user.role === Roles.INSTRUCTOR && tableName === 'alumnos'
-      && Object.keys(request.body ?? {}).some((field) => !instructorStudentEditableFields.has(field))) {
-      throw new ApiError(403, 'El instructor solo puede editar los datos personales y el grado del alumno.')
-    }
     if (tableName === 'administradores') {
       throw new ApiError(403, 'Los administradores pueden crearse y borrarse, pero no editarse.')
     }

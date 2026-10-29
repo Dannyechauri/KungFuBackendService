@@ -292,9 +292,8 @@ describe('auth and backwards-compatible database API', () => {
       headers: authHeaders(instructorCookie),
       payload: { nombre: 'Alumno actualizado por instructor' },
     })
-    expect(updatedByInstructor.statusCode).toBe(200)
-    expect(updatedByInstructor.json().nombre).toBe('Alumno actualizado por instructor')
-    await pool.query('UPDATE alumnos SET nombre = $2 WHERE id_alumno = $1', [studentId, 'José Pérez'])
+    expect(updatedByInstructor.statusCode).toBe(403)
+    expect((await pool.query('SELECT nombre FROM alumnos WHERE id_alumno = $1', [studentId])).rows[0].nombre).toBe('José Pérez')
     const createdByInstructor = await app.inject({
       method: 'POST',
       url: '/api/database/tables/alumnos/rows',
@@ -302,6 +301,65 @@ describe('auth and backwards-compatible database API', () => {
       payload: { numero_matricula: 'TEST-NO', fecha_ingreso: '2092-01-01', nombre: 'No permitido', id_grado: ids.grade },
     })
     expect(createdByInstructor.statusCode).toBe(403)
+  })
+
+  it('lets admins and instructors add and read student comments, but not students', async () => {
+    const { cookie: adminCookie } = await login('admin@test.invalid')
+    const { cookie: instructorCookie } = await login('instructor@test.invalid')
+    const { cookie: studentCookie } = await login('student@test.invalid')
+    const addComment = (cookie: string | undefined, comment: string) => app.inject({
+      method: 'POST',
+      url: `/api/database/students/${ids.student}/comments`,
+      headers: authHeaders(cookie),
+      payload: { comment },
+    })
+
+    const instructorComment = await addComment(instructorCookie, 'Revisar postura en la próxima clase.')
+    expect(instructorComment.statusCode).toBe(200)
+    expect(instructorComment.json()).toMatchObject({
+      author: 'Instructor test', role: 'INSTRUCTOR', comment: 'Revisar postura en la próxima clase.',
+    })
+    expect(instructorComment.json().createdAt).toBeTruthy()
+
+    const adminComment = await addComment(adminCookie, 'La familia confirmó el cambio de horario.')
+    expect(adminComment.statusCode).toBe(200)
+    const adminCommentId = adminComment.json().id
+    const visibleToInstructor = await app.inject({
+      url: `/api/database/students/${ids.student}/comments`, headers: authHeaders(instructorCookie),
+    })
+    expect(visibleToInstructor.statusCode).toBe(200)
+    expect(visibleToInstructor.json()).toHaveLength(2)
+    expect(visibleToInstructor.json()).toContainEqual(expect.objectContaining({ author: 'Admin test', role: 'ADMIN' }))
+    expect((await app.inject({
+      url: `/api/database/students/${ids.student}/comments`, headers: authHeaders(studentCookie),
+    })).statusCode).toBe(403)
+    expect((await addComment(studentCookie, 'No autorizado')).statusCode).toBe(403)
+    expect((await addComment(instructorCookie, '   ')).statusCode).toBe(400)
+    const instructorCannotDeleteAdminComment = await app.inject({
+      method: 'DELETE',
+      url: `/api/database/students/${ids.student}/comments/${adminCommentId}`,
+      headers: authHeaders(instructorCookie),
+    })
+    expect(instructorCannotDeleteAdminComment.statusCode).toBe(403)
+    const adminDeletesInstructorComment = await app.inject({
+      method: 'DELETE',
+      url: `/api/database/students/${ids.student}/comments/${instructorComment.json().id}`,
+      headers: authHeaders(adminCookie),
+    })
+    expect(adminDeletesInstructorComment.statusCode).toBe(200)
+    const instructorOwnComment = await addComment(instructorCookie, 'Comentario propio para borrar.')
+    const instructorDeletesOwnComment = await app.inject({
+      method: 'DELETE',
+      url: `/api/database/students/${ids.student}/comments/${instructorOwnComment.json().id}`,
+      headers: authHeaders(instructorCookie),
+    })
+    expect(instructorDeletesOwnComment.statusCode).toBe(200)
+    expect((await app.inject({
+      method: 'DELETE',
+      url: `/api/database/students/${ids.student}/comments/${adminCommentId}`,
+      headers: authHeaders(studentCookie),
+    })).statusCode).toBe(403)
+    expect((await app.inject({ url: `/api/database/students/${ids.student}/comments` })).statusCode).toBe(401)
   })
 
   it('limits repeated login attempts per IP and account', async () => {
@@ -527,6 +585,30 @@ describe('auth and backwards-compatible database API', () => {
     ]))
     expect(instructors.json()[0]).not.toHaveProperty('correo_electronico')
     expect(instructors.json()[0]).not.toHaveProperty('password_hash')
+  })
+
+  it('returns today\'s active student birthdays to admins, students and instructors', async () => {
+    await pool.query(`
+      UPDATE alumnos
+      SET fecha_nacimiento = make_date(
+        2000,
+        EXTRACT(MONTH FROM CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Madrid')::int,
+        EXTRACT(DAY FROM CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Madrid')::int
+      )
+      WHERE id_alumno = $1
+    `, [ids.student])
+    const admin = await login('admin@test.invalid')
+    const student = await login('student@test.invalid')
+    const instructor = await login('instructor@test.invalid')
+
+    for (const cookie of [admin.cookie, student.cookie, instructor.cookie]) {
+      const response = await app.inject({ url: '/api/me/birthdays/today', headers: authHeaders(cookie) })
+      expect(response.statusCode).toBe(200)
+      expect(response.json()).toContainEqual({ id: ids.student, name: 'Alumno test' })
+    }
+
+    expect((await app.inject({ url: '/api/me/birthdays/today' })).statusCode).toBe(401)
+    await pool.query("UPDATE alumnos SET fecha_nacimiento = DATE '2000-01-01' WHERE id_alumno = $1", [ids.student])
   })
 
   it('shows students and instructors only their own profile and known forms', async () => {
