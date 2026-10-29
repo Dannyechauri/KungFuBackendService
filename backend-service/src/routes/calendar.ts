@@ -31,6 +31,7 @@ const localDateTime = z.string().regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})
 
 const participantLimit = z.number().int().positive().max(10_000).nullable().optional()
 const showAttendeeCount = z.boolean().optional()
+const eventDescription = z.string().trim().max(2000).nullable().optional()
 
 const eventInput = z.object({
   courseId: identifier,
@@ -38,6 +39,7 @@ const eventInput = z.object({
   roomId: identifier,
   startAt: localDateTime,
   endAt: localDateTime,
+  description: eventDescription,
   participantLimit,
   showAttendeeCount,
 }).strict()
@@ -48,6 +50,7 @@ const eventPatch = z.object({
   roomId: identifier.nullable().optional(),
   startAt: localDateTime.optional(),
   endAt: localDateTime.optional(),
+  description: eventDescription,
   participantLimit,
   showAttendeeCount,
 }).strict().refine((value) => Object.keys(value).length > 0)

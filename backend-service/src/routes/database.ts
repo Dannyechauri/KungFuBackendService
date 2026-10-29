@@ -265,6 +265,7 @@ async function insertRow(pool: Pool, tableName: string, payload: Row) {
       roomId: Number(roomId),
       startAt,
       endAt,
+      description: payload.descripcion === undefined ? undefined : payload.descripcion === null ? null : String(payload.descripcion),
     })
     if (!inserted) throw new ApiError(500, 'No se pudo guardar la actividad.')
     const row = await pool.query<Row>('SELECT * FROM cursos_agendados WHERE id_curso_agendado = $1', [inserted.id_curso_agendado])
@@ -359,6 +360,9 @@ async function updateRow(pool: Pool, tableName: string, id: string, payload: Row
         : { roomId: payload.id_sala === null || payload.id_sala === '' ? null : Number(payload.id_sala) }),
       startAt: String(payload.fecha_hora ?? row.fecha_hora),
       endAt: String(payload.fecha_hora_fin ?? row.fecha_hora_fin),
+      ...(payload.descripcion === undefined
+        ? {}
+        : { description: payload.descripcion === null ? null : String(payload.descripcion) }),
     })
     const updated = await pool.query<Row>('SELECT * FROM cursos_agendados WHERE id_curso_agendado::text = $1', [id])
     return updated.rows[0]

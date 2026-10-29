@@ -23,6 +23,7 @@ export type CalendarEventInput = ParticipationSettings & {
   roomId: number
   startAt: string
   endAt: string
+  description?: string | null | undefined
 }
 
 export type RecurrenceInput = ParticipationSettings & {
@@ -42,6 +43,7 @@ export type CalendarEventPatch = ParticipationSettings & {
   roomId?: number | null | undefined
   startAt?: string | undefined
   endAt?: string | undefined
+  description?: string | null | undefined
 }
 
 export type RecurrencePatch = ParticipationSettings & {
@@ -293,6 +295,7 @@ const eventSelect = `
          c.nombre AS curso_nombre,
          c.tema AS curso_tema,
          c.descripcion AS curso_descripcion,
+         ca.descripcion,
          c.tipo_curso,
          i.nombre AS instructor_nombre,
          s.nombre AS sala_nombre,
@@ -493,11 +496,11 @@ export async function createCalendarEvent(pool: Pool, input: CalendarEventInput)
     await assertAvailable(client, input.roomId, start, end)
     const result = await client.query<{ id_curso_agendado: number }>(`
       INSERT INTO cursos_agendados
-        (id_curso, id_instructor, id_sala, fecha_hora, fecha_hora_fin, activo, limite_participantes, mostrar_asistentes)
-      VALUES ($1, $2, $3, $4::timestamp, $5::timestamp, TRUE, $6, $7)
+        (id_curso, id_instructor, id_sala, fecha_hora, fecha_hora_fin, activo, limite_participantes, mostrar_asistentes, descripcion)
+      VALUES ($1, $2, $3, $4::timestamp, $5::timestamp, TRUE, $6, $7, $8)
       RETURNING id_curso_agendado
     `, [input.courseId, input.instructorId, input.roomId, start, end,
-      input.participantLimit ?? null, input.showAttendeeCount ?? true])
+      input.participantLimit ?? null, input.showAttendeeCount ?? true, input.description?.trim() || null])
     return result.rows[0]
   })
 }
@@ -563,11 +566,13 @@ export async function updateCalendarEvent(pool: Pool, id: number, input: Calenda
             ELSE modificado_manualmente
           END,
           limite_participantes = CASE WHEN $8 THEN $9::int ELSE limite_participantes END,
-          mostrar_asistentes = COALESCE($10, mostrar_asistentes)
+          mostrar_asistentes = COALESCE($10, mostrar_asistentes),
+          descripcion = CASE WHEN $11 THEN $12::text ELSE descripcion END
       WHERE id_curso_agendado = $1
       RETURNING id_curso_agendado
     `, [id, courseId, instructorId, roomId, interval.start, interval.end, scheduleChanged,
-      input.participantLimit !== undefined, input.participantLimit ?? null, input.showAttendeeCount ?? null])
+      input.participantLimit !== undefined, input.participantLimit ?? null, input.showAttendeeCount ?? null,
+      input.description !== undefined, input.description?.trim() || null])
     return result.rows[0]
   })
 }

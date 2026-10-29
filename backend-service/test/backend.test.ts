@@ -1287,6 +1287,7 @@ describe('agenda API', () => {
         roomId: ids.primaryRoom,
         startAt: '2092-06-14T10:00',
         endAt: '2092-06-15T17:00',
+        description: 'Sesión de prueba en dos jornadas.',
       },
     })
     expect(created.statusCode).toBe(201)
@@ -1304,8 +1305,40 @@ describe('agenda API', () => {
         tipo_curso: 'CURSO_ESPECIAL',
         fecha_hora: '2092-06-14T10:00:00',
         fecha_hora_fin: '2092-06-15T17:00:00',
+        descripcion: 'Sesión de prueba en dos jornadas.',
         activo: true,
       }),
+    ]))
+
+    const eventId = created.json().id_curso_agendado
+    const updateDescription = await app.inject({
+      method: 'PATCH',
+      url: `/api/calendar/events/${eventId}`,
+      headers: authHeaders(cookie),
+      payload: { description: 'Sesión de repaso.' },
+    })
+    expect(updateDescription.statusCode).toBe(200)
+    const updatedList = await app.inject({
+      url: '/api/calendar/events?from=2092-06-14T00:00&to=2092-06-16T00:00',
+      headers: authHeaders(cookie),
+    })
+    expect(updatedList.json()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id_curso_agendado: eventId, descripcion: 'Sesión de repaso.' }),
+    ]))
+
+    const clearDescription = await app.inject({
+      method: 'PATCH',
+      url: `/api/calendar/events/${eventId}`,
+      headers: authHeaders(cookie),
+      payload: { description: null },
+    })
+    expect(clearDescription.statusCode).toBe(200)
+    const clearedList = await app.inject({
+      url: '/api/calendar/events?from=2092-06-14T00:00&to=2092-06-16T00:00',
+      headers: authHeaders(cookie),
+    })
+    expect(clearedList.json()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id_curso_agendado: eventId, descripcion: null }),
     ]))
   })
 
