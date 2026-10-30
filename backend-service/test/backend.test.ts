@@ -1908,6 +1908,55 @@ describe('student forms on grade changes', () => {
     )
     expect(knownAfterDemotion.rows.map((form) => Number(form.id_forma))).toEqual([lowerForm])
   })
+
+  it('notifies an instructor account of a promotion and removes the notice after acknowledgement', async () => {
+    const maximumOrder = await pool.query<{ next_order: number }>(
+      'SELECT COALESCE(MAX(orden_grado), 0) + 1 AS next_order FROM grados',
+    )
+    const promotedGrade = await pool.query<{ id_grado: number }>(`
+      INSERT INTO grados (nombre, orden_grado, color_cinturon)
+      VALUES ('Ascenso de prueba', $1, 'Negro')
+      RETURNING id_grado
+    `, [Number(maximumOrder.rows[0]!.next_order)])
+    const { cookie: adminCookie } = await login('admin@test.invalid')
+    const update = await app.inject({
+      method: 'PUT',
+      url: `/api/database/tables/alumnos/rows/${ids.instructorStudent}`,
+      headers: authHeaders(adminCookie),
+      payload: { id_grado: promotedGrade.rows[0]!.id_grado },
+    })
+    expect(update.statusCode).toBe(200)
+
+    const { cookie: instructorCookie } = await login('instructor@test.invalid')
+    const notices = await app.inject({ url: '/api/me/promotions', headers: authHeaders(instructorCookie) })
+    expect(notices.statusCode).toBe(200)
+    expect(notices.json()).toEqual([expect.objectContaining({
+      grado_anterior: expect.any(String),
+      grado_nuevo: 'Ascenso de prueba',
+    })])
+
+    const { cookie: studentCookie } = await login('student@test.invalid')
+    expect((await app.inject({ url: '/api/me/promotions', headers: authHeaders(studentCookie) })).json()).toEqual([])
+
+    const noticeId = notices.json()[0].id_aviso
+    const acknowledged = await app.inject({
+      method: 'POST',
+      url: `/api/me/promotions/${noticeId}/acknowledge`,
+      headers: authHeaders(instructorCookie),
+    })
+    expect(acknowledged.statusCode).toBe(200)
+    expect(acknowledged.json()).toEqual({ acknowledged: true })
+    expect((await app.inject({ url: '/api/me/promotions', headers: authHeaders(instructorCookie) })).json()).toEqual([])
+
+    const demotion = await app.inject({
+      method: 'PUT',
+      url: `/api/database/tables/alumnos/rows/${ids.instructorStudent}`,
+      headers: authHeaders(adminCookie),
+      payload: { id_grado: ids.grade },
+    })
+    expect(demotion.statusCode).toBe(200)
+    expect((await app.inject({ url: '/api/me/promotions', headers: authHeaders(instructorCookie) })).json()).toEqual([])
+  })
 })
 
 describe('database migration runner', () => {

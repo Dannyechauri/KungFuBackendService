@@ -159,6 +159,37 @@ export const meRoutes: FastifyPluginAsync<MeRoutesOptions> = async (app, { pool 
     }
   })
 
+  app.get('/promotions', readLimit, async (request) => {
+    const studentId = requireStudentId(request)
+    const result = await pool.query(`
+      SELECT id_aviso::text, grado_anterior, grado_nuevo,
+             to_char(fecha_creacion AT TIME ZONE 'Europe/Madrid', 'YYYY-MM-DD"T"HH24:MI:SS') AS fecha_creacion
+      FROM avisos_ascenso
+      WHERE id_alumno = $1 AND fecha_confirmacion IS NULL
+      ORDER BY fecha_creacion, id_aviso
+    `, [studentId])
+    return result.rows
+  })
+
+  app.post<{ Params: { noticeId: string } }>('/promotions/:noticeId/acknowledge', writeLimit, async (request) => {
+    const studentId = requireStudentId(request)
+    const id = parseFormId(request.params.noticeId)
+    const acknowledged = await pool.query(`
+      UPDATE avisos_ascenso
+      SET fecha_confirmacion = CURRENT_TIMESTAMP
+      WHERE id_aviso = $1 AND id_alumno = $2 AND fecha_confirmacion IS NULL
+      RETURNING id_aviso
+    `, [id, studentId])
+    if (acknowledged.rows[0]) return { acknowledged: true }
+
+    const existing = await pool.query(
+      'SELECT 1 FROM avisos_ascenso WHERE id_aviso = $1 AND id_alumno = $2',
+      [id, studentId],
+    )
+    if (!existing.rows[0]) throw new ApiError(404, 'No se encontró el aviso de ascenso pendiente.')
+    return { acknowledged: true }
+  })
+
   // El alumno marca una forma de su grado como "aprendiendo" y su avance; la forma sabida la registra la administración.
   app.put<{ Params: { formId: string }; Body: unknown }>('/forms/:formId/progress', writeLimit, async (request) => {
     const studentId = requireStudentId(request)
