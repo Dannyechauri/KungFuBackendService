@@ -1429,6 +1429,67 @@ describe('agenda API', () => {
     ]))
   })
 
+  it('notifies event participants and the assigned instructor until each account acknowledges the notice', async () => {
+    const { cookie: adminCookie } = await login('admin@test.invalid')
+    const { cookie: studentCookie } = await login('student@test.invalid')
+    const { cookie: instructorCookie } = await login('instructor@test.invalid')
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/calendar/events',
+      headers: authHeaders(adminCookie),
+      payload: {
+        courseId: ids.specialCourse,
+        instructorId: ids.instructor,
+        roomId: ids.primaryRoom,
+        startAt: '2095-10-16T18:00',
+        endAt: '2095-10-16T19:00',
+      },
+    })
+    expect(created.statusCode).toBe(201)
+    const eventId = Number(created.json().id_curso_agendado)
+    await pool.query(
+      "INSERT INTO participaciones_evento (id_curso_agendado, id_alumno, rol) VALUES ($1, $2, 'ALUMNO')",
+      [eventId, ids.student],
+    )
+
+    const cancelled = await app.inject({
+      method: 'POST',
+      url: `/api/calendar/events/${eventId}/cancel`,
+      headers: authHeaders(adminCookie),
+    })
+    expect(cancelled.statusCode).toBe(200)
+
+    const studentNotices = await app.inject({ url: '/api/calendar/cancellation-notifications', headers: authHeaders(studentCookie) })
+    expect(studentNotices.statusCode).toBe(200)
+    expect(studentNotices.json()).toEqual([expect.objectContaining({ id_curso_agendado: String(eventId), curso_nombre: 'Curso especial test' })])
+    const instructorNotices = await app.inject({ url: '/api/calendar/cancellation-notifications', headers: authHeaders(instructorCookie) })
+    expect(instructorNotices.json()).toHaveLength(1)
+
+    const noticeId = studentNotices.json()[0].id_aviso
+    const acknowledged = await app.inject({
+      method: 'POST',
+      url: `/api/calendar/cancellation-notifications/${noticeId}/acknowledge`,
+      headers: authHeaders(studentCookie),
+    })
+    expect(acknowledged.statusCode).toBe(200)
+    expect(acknowledged.json()).toEqual({ acknowledged: true })
+    const repeatedAcknowledgement = await app.inject({
+      method: 'POST',
+      url: `/api/calendar/cancellation-notifications/${noticeId}/acknowledge`,
+      headers: authHeaders(studentCookie),
+    })
+    expect(repeatedAcknowledgement.statusCode).toBe(200)
+    const noLongerPending = await app.inject({ url: '/api/calendar/cancellation-notifications', headers: authHeaders(studentCookie) })
+    expect(noLongerPending.json()).toEqual([])
+
+    const otherAccountAcknowledgement = await app.inject({
+      method: 'POST',
+      url: `/api/calendar/cancellation-notifications/${noticeId}/acknowledge`,
+      headers: authHeaders(instructorCookie),
+    })
+    expect(otherAccountAcknowledgement.statusCode).toBe(404)
+  })
+
   it('materializes habitual weekly rules, supports moving occurrences and cancelling a rule', async () => {
     const { cookie } = await login('instructor@test.invalid')
     const rule = await app.inject({
@@ -1458,6 +1519,10 @@ describe('agenda API', () => {
       event.id_horario_recurrente === rule.json().rules[1].id_horario_recurrente)
     expect(generated.length).toBeGreaterThan(4)
     expect(generated.every((event: { fecha_hora_fin: string }) => event.fecha_hora_fin.endsWith('11:00:00'))).toBe(true)
+    await pool.query(`
+      INSERT INTO participaciones_serie (id_horario_recurrente, id_alumno, rol, fecha_desde)
+      VALUES ($1, $2, 'ALUMNO', '2092-08-01')
+    `, [rule.json().rules[0].id_horario_recurrente, ids.student])
 
     const target = generated[0]
     const moved = await app.inject({
@@ -1493,6 +1558,12 @@ describe('agenda API', () => {
     })
     expect(cancelled.statusCode).toBe(200)
     expect(cancelled.json().activo).toBe(false)
+    const { cookie: studentCookie } = await login('student@test.invalid')
+    const seriesNotices = await app.inject({
+      url: '/api/calendar/cancellation-notifications',
+      headers: authHeaders(studentCookie),
+    })
+    expect(seriesNotices.json()).toHaveLength(cancelled.json().occurrencesCancelled)
   })
 
   it('rejects student writes and invalid event intervals', async () => {

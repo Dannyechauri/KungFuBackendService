@@ -6,6 +6,7 @@ import { mayManageSchedule, mayManageSchoolData, requireRole, requireUser, Roles
 import { ApiError } from '../errors.js'
 import { joinEvent, leaveEvent, listEventParticipants } from '../agenda/participation-service.js'
 import {
+  acknowledgeCancellationNotice,
   cancelCalendarEvent,
   cancelRecurringRule,
   createCalendarCourse,
@@ -15,6 +16,7 @@ import {
   listCalendarCourses,
   listCalendarEvents,
   listCalendarRooms,
+  listPendingCancellationNotices,
   listRecurringRules,
   updateCalendarCourse,
   updateCalendarEvent,
@@ -178,6 +180,17 @@ export const calendarRoutes: FastifyPluginAsync<CalendarRoutesOptions> = async (
       role: user.role,
       studentId: user.studentId ?? null,
     })
+  })
+
+  app.get('/cancellation-notifications', readLimit, async (request) => {
+    const user = requireUser(request)
+    return listPendingCancellationNotices(pool, user.studentId)
+  })
+
+  app.post<{ Params: { id: string } }>('/cancellation-notifications/:id/acknowledge', writeLimit, async (request) => {
+    const user = requireUser(request)
+    if (user.studentId === null) throw new ApiError(403, 'Solo los participantes pueden confirmar este aviso.')
+    return acknowledgeCancellationNotice(pool, parseId(request.params.id), user.studentId)
   })
 
   app.post<{ Body: unknown }>('/events', writeLimit, async (request, reply) => {

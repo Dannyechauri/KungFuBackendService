@@ -577,6 +577,76 @@ export async function updateCalendarEvent(pool: Pool, id: number, input: Calenda
   })
 }
 
+async function createCancellationNotices(client: PoolClient, eventIds: number[]) {
+  if (!eventIds.length) return
+  await client.query(`
+    WITH selected_events AS (
+      SELECT unnest($1::bigint[]) AS id_curso_agendado
+    ), recipients AS (
+      SELECT se.id_curso_agendado, pe.id_alumno
+      FROM selected_events se
+      JOIN participaciones_evento pe USING (id_curso_agendado)
+      UNION
+      SELECT se.id_curso_agendado, ps.id_alumno
+      FROM selected_events se
+      JOIN cursos_agendados ca USING (id_curso_agendado)
+      JOIN participaciones_serie ps
+        ON ps.id_horario_recurrente = ca.id_horario_recurrente
+       AND ca.fecha_hora >= ps.fecha_desde::timestamp
+      UNION
+      SELECT se.id_curso_agendado, ie.id_alumno
+      FROM selected_events se
+      JOIN invitaciones_evento ie USING (id_curso_agendado)
+      WHERE ie.estado IN ('PENDIENTE', 'ACEPTADA')
+      UNION
+      SELECT se.id_curso_agendado, i.id_alumno
+      FROM selected_events se
+      JOIN cursos_agendados ca USING (id_curso_agendado)
+      JOIN instructores i ON i.id_instructor = ca.id_instructor
+      WHERE i.id_alumno IS NOT NULL
+    )
+    INSERT INTO avisos_cancelacion_evento (id_curso_agendado, id_alumno)
+    SELECT DISTINCT id_curso_agendado, id_alumno
+    FROM recipients
+    WHERE id_alumno IS NOT NULL
+    ON CONFLICT (id_curso_agendado, id_alumno) DO NOTHING
+  `, [eventIds])
+}
+
+export async function listPendingCancellationNotices(pool: Pool, studentId: number | null) {
+  if (studentId === null) return []
+  const result = await pool.query(`
+    SELECT ac.id_aviso, ac.id_curso_agendado, c.nombre AS curso_nombre,
+           to_char(ca.fecha_hora, 'YYYY-MM-DD"T"HH24:MI:SS') AS fecha_hora,
+           to_char(ca.fecha_hora_fin, 'YYYY-MM-DD"T"HH24:MI:SS') AS fecha_hora_fin,
+           s.nombre AS sala_nombre
+    FROM avisos_cancelacion_evento ac
+    JOIN cursos_agendados ca USING (id_curso_agendado)
+    JOIN cursos c ON c.id_curso = ca.id_curso
+    LEFT JOIN salas s ON s.id_sala = ca.id_sala
+    WHERE ac.id_alumno = $1 AND ac.fecha_confirmacion IS NULL
+    ORDER BY ac.fecha_creacion DESC, ac.id_aviso DESC
+  `, [studentId])
+  return result.rows
+}
+
+export async function acknowledgeCancellationNotice(pool: Pool, noticeId: number, studentId: number) {
+  const result = await pool.query(`
+    UPDATE avisos_cancelacion_evento
+    SET fecha_confirmacion = CURRENT_TIMESTAMP
+    WHERE id_aviso = $1 AND id_alumno = $2 AND fecha_confirmacion IS NULL
+    RETURNING id_aviso
+  `, [noticeId, studentId])
+  if (result.rows[0]) return { acknowledged: true }
+
+  const existing = await pool.query(
+    'SELECT 1 FROM avisos_cancelacion_evento WHERE id_aviso = $1 AND id_alumno = $2',
+    [noticeId, studentId],
+  )
+  if (!existing.rows[0]) throw new ApiError(404, 'No se encontró el aviso pendiente.')
+  return { acknowledged: true }
+}
+
 export async function cancelCalendarEvent(pool: Pool, id: number) {
   return inTransaction(pool, async (client) => {
     await client.query('SELECT pg_advisory_xact_lock($1)', [scheduleLock])
@@ -586,6 +656,7 @@ export async function cancelCalendarEvent(pool: Pool, id: number) {
       RETURNING id_curso_agendado
     `, [id])
     if (!result.rows[0]) throw new ApiError(404, 'No se encontró una actividad activa con ese identificador.')
+    await createCancellationNotices(client, [id])
     return { id_curso_agendado: id, activo: false }
   })
 }
@@ -706,11 +777,16 @@ export async function updateRecurringRule(pool: Pool, id: number, input: Recurre
       ORDER BY fecha_recurrencia
     `, [id])
 
+    const cancelledEventIds: number[] = []
     for (const occurrence of future.rows) {
       const date = occurrence.fecha_recurrencia
       const shouldKeep = date >= startsOn && (!endsOn || date <= endsOn) && dateToWeekday(date) === weekday
       if (!shouldKeep) {
-        await client.query('UPDATE cursos_agendados SET activo = FALSE WHERE id_curso_agendado = $1', [occurrence.id_curso_agendado])
+        const cancelled = await client.query<{ id_curso_agendado: number }>(
+          'UPDATE cursos_agendados SET activo = FALSE WHERE id_curso_agendado = $1 RETURNING id_curso_agendado',
+          [occurrence.id_curso_agendado],
+        )
+        if (cancelled.rows[0]) cancelledEventIds.push(Number(cancelled.rows[0].id_curso_agendado))
         continue
       }
       const start = `${date} ${startTime}`
@@ -723,6 +799,7 @@ export async function updateRecurringRule(pool: Pool, id: number, input: Recurre
         WHERE id_curso_agendado = $1
       `, [occurrence.id_curso_agendado, courseId, instructorId, roomId, start, end])
     }
+    await createCancellationNotices(client, cancelledEventIds)
 
     const endDate = endsOn && daysBetween(startsOn, endsOn) < materializationDays
       ? addDays(endsOn, 1)
@@ -741,12 +818,13 @@ export async function cancelRecurringRule(pool: Pool, id: number) {
       RETURNING id_horario_recurrente
     `, [id])
     if (!result.rows[0]) throw new ApiError(404, 'No se encontró un horario recurrente activo.')
-    const cancelled = await client.query(`
+    const cancelled = await client.query<{ id_curso_agendado: number }>(`
       UPDATE cursos_agendados SET activo = FALSE
       WHERE id_horario_recurrente = $1 AND activo = TRUE
         AND fecha_hora >= (CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Madrid')
       RETURNING id_curso_agendado
     `, [id])
+    await createCancellationNotices(client, cancelled.rows.map((row) => Number(row.id_curso_agendado)))
     return { id_horario_recurrente: id, activo: false, occurrencesCancelled: cancelled.rowCount ?? 0 }
   })
 }
