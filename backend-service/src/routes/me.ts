@@ -1,7 +1,9 @@
 import type { FastifyPluginAsync } from 'fastify'
 import type { Pool } from 'pg'
+import bcrypt from 'bcryptjs'
 import { z } from 'zod'
 
+import { hashPassword, MIN_PASSWORD_LENGTH } from '../auth/auth-service.js'
 import { requireUser } from '../domain/auth.js'
 import { ApiError } from '../errors.js'
 
@@ -11,6 +13,7 @@ const readLimit = { config: { rateLimit: { max: 120, timeWindow: '1 minute' } } 
 const writeLimit = { config: { rateLimit: { max: 60, timeWindow: '1 minute' } } }
 const formId = z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER)
 const progressInput = z.object({ percent: z.number().int().min(0).max(100) }).strict()
+const passwordInput = z.object({ currentPassword: z.string().min(1), newPassword: z.string().min(1) }).strict()
 
 function parseFormId(value: string) {
   const parsed = formId.safeParse(value)
@@ -26,6 +29,45 @@ function requireStudentId(request: Parameters<typeof requireUser>[0]) {
 
 /** Ficha propia de alumnos e instructores; siempre se resuelve desde la sesión, nunca por parámetro. */
 export const meRoutes: FastifyPluginAsync<MeRoutesOptions> = async (app, { pool }) => {
+  app.put<{ Body: unknown }>('/password', writeLimit, async (request) => {
+    const user = requireUser(request)
+    const parsed = passwordInput.safeParse(request.body ?? {})
+    if (!parsed.success) throw new ApiError(400, 'Indique la contraseña actual y la nueva contraseña.')
+    if (parsed.data.newPassword.trim().length < MIN_PASSWORD_LENGTH) {
+      throw new ApiError(400, `La contraseña debe tener al menos ${MIN_PASSWORD_LENGTH} caracteres.`)
+    }
+
+    const isAdmin = user.role === 'ADMIN'
+    const table = isAdmin ? 'administradores' : 'alumnos'
+    const idColumn = isAdmin ? 'id_administrador' : 'id_alumno'
+    const accountRole = isAdmin ? 'ADMIN' : 'USER'
+    const client = await pool.connect()
+    try {
+      await client.query('BEGIN')
+      const account = await client.query<{ password_hash: string | null }>(
+        `SELECT password_hash FROM ${table} WHERE ${idColumn} = $1 FOR UPDATE`,
+        [user.userId],
+      )
+      const currentHash = account.rows[0]?.password_hash
+      if (!currentHash) throw new ApiError(404, 'No se encontró la cuenta.')
+      if (!await bcrypt.compare(parsed.data.currentPassword, currentHash)) {
+        throw new ApiError(401, 'La contraseña actual no es correcta.')
+      }
+
+      const newHash = await hashPassword(parsed.data.newPassword)
+      await client.query(`UPDATE ${table} SET password_hash = $1 WHERE ${idColumn} = $2`, [newHash, user.userId])
+      await client.query('DELETE FROM api_sessions WHERE role = $1 AND user_id = $2', [accountRole, user.userId])
+      await client.query('COMMIT')
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined)
+      throw error
+    } finally {
+      client.release()
+    }
+    request.session.delete()
+    return { updated: true }
+  })
+
   app.get('/birthdays/today', readLimit, async (request) => {
     requireUser(request)
     const result = await pool.query<{ id_alumno: string; nombre: string }>(`

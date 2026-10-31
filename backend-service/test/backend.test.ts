@@ -721,6 +721,42 @@ describe('auth and backwards-compatible database API', () => {
     await pool.query('DELETE FROM alumno_forma WHERE id_alumno = $1 AND id_forma = $2', [ids.student, pendingForm])
   })
 
+  it('changes only the authenticated account password after checking the current password', async () => {
+    const { cookie: studentCookie } = await login('student@test.invalid')
+    const { cookie: secondStudentCookie } = await login('student@test.invalid')
+    const { cookie: adminCookie } = await login('admin@test.invalid')
+    const originalStudentHash = (await pool.query<{ password_hash: string }>(
+      'SELECT password_hash FROM alumnos WHERE id_alumno = $1', [ids.student],
+    )).rows[0]!.password_hash
+    const changePassword = (cookie: string | undefined, payload: unknown) => app.inject({
+      method: 'PUT',
+      url: '/api/me/password',
+      headers: authHeaders(cookie),
+      payload: payload as object,
+    })
+
+    try {
+      expect((await changePassword(undefined, { currentPassword: 'test-password-123', newPassword: 'new-test-password' })).statusCode).toBe(401)
+      expect((await changePassword(studentCookie, { currentPassword: 'incorrect-password', newPassword: 'new-test-password' })).statusCode).toBe(401)
+      expect((await changePassword(studentCookie, { currentPassword: 'test-password-123', newPassword: 'short' })).statusCode).toBe(400)
+
+      const studentChange = await changePassword(studentCookie, {
+        currentPassword: 'test-password-123', newPassword: 'new-test-password-123',
+      })
+      expect(studentChange.statusCode).toBe(200)
+      expect(studentChange.json()).toEqual({ updated: true })
+      const studentHash = (await pool.query<{ password_hash: string }>(
+        'SELECT password_hash FROM alumnos WHERE id_alumno = $1', [ids.student],
+      )).rows[0]!.password_hash
+      expect(await bcrypt.compare('new-test-password-123', studentHash)).toBe(true)
+      expect((await app.inject({ url: '/api/auth/me', headers: authHeaders(studentCookie) })).statusCode).toBe(401)
+      expect((await app.inject({ url: '/api/auth/me', headers: authHeaders(secondStudentCookie) })).statusCode).toBe(401)
+      expect((await app.inject({ url: '/api/auth/me', headers: authHeaders(adminCookie) })).statusCode).toBe(200)
+    } finally {
+      await pool.query('UPDATE alumnos SET password_hash = $1 WHERE id_alumno = $2', [originalStudentHash, ids.student])
+    }
+  })
+
   it('restricts self-service attendance rows to the authenticated student', async () => {
     const { cookie: adminCookie } = await login('admin@test.invalid')
     const event = await app.inject({
