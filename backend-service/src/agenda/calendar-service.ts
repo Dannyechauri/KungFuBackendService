@@ -15,6 +15,27 @@ export type ParticipationSettings = {
 export type CalendarViewer = {
   role: string
   studentId: number | null
+  userId: number
+  instructorId: number | null
+}
+
+export type CalendarActor = { role: 'ADMIN' | 'INSTRUCTOR'; userId: number; instructorId: number | null }
+
+export function calendarActor(user: { role: string; userId: number; instructorId?: number | null }): CalendarActor {
+  const role = user.role
+  if (role === 'ADMIN' || role === 'INSTRUCTOR') return { role, userId: user.userId, instructorId: user.instructorId ?? null }
+  throw new ApiError(403, 'Solo administradores e instructores pueden gestionar la agenda.')
+}
+
+// Los registros sin creador conocido solo los puede modificar el administrador.
+function ownsRecord(creatorRole: string | null, creatorId: string | number | null, who: { role: string; userId: number }) {
+  return who.role === 'ADMIN' || (creatorRole === who.role && Number(creatorId) === who.userId)
+}
+
+function assertCanModify(owner: { creador_rol: string | null; creador_id: string | number | null }, actor: CalendarActor) {
+  if (!ownsRecord(owner.creador_rol, owner.creador_id, actor)) {
+    throw new ApiError(403, 'Solo el administrador o el creador pueden modificar esta actividad.')
+  }
 }
 
 export type CalendarEventInput = ParticipationSettings & {
@@ -92,6 +113,8 @@ type RecurrenceRow = {
   fecha_fin: string | null
   limite_participantes: number | null
   mostrar_asistentes: boolean
+  creador_rol: 'ADMIN' | 'INSTRUCTOR' | null
+  creador_id: string | null
 }
 
 function validDate(value: string) {
@@ -225,7 +248,7 @@ async function materializeRules(client: PoolClient, fromDate: string, toDateExcl
   const rules = await client.query<RecurrenceRow>(`
     SELECT id_horario_recurrente, id_curso, id_instructor, id_sala, dia_semana,
            hora_inicio::text, hora_fin::text, fecha_inicio::text, fecha_fin::text,
-           limite_participantes, mostrar_asistentes
+           limite_participantes, mostrar_asistentes, creador_rol, creador_id::text
     FROM horarios_recurrentes
     WHERE activo = TRUE
       AND fecha_inicio < $2::date
@@ -255,11 +278,12 @@ async function materializeRules(client: PoolClient, fromDate: string, toDateExcl
           const created = await client.query<{ id_curso_agendado: number }>(`
             INSERT INTO cursos_agendados
               (id_curso, id_instructor, id_sala, fecha_hora, fecha_hora_fin, activo,
-               id_horario_recurrente, fecha_recurrencia, limite_participantes, mostrar_asistentes)
-            VALUES ($1, $2, $3, $4::timestamp, $5::timestamp, TRUE, $6, $7::date, $8, $9)
+               id_horario_recurrente, fecha_recurrencia, limite_participantes, mostrar_asistentes,
+               creador_rol, creador_id)
+            VALUES ($1, $2, $3, $4::timestamp, $5::timestamp, TRUE, $6, $7::date, $8, $9, $10, $11)
             RETURNING id_curso_agendado
           `, [rule.id_curso, rule.id_instructor, roomId, start, end, rule.id_horario_recurrente, date,
-            limit, rule.mostrar_asistentes])
+            limit, rule.mostrar_asistentes, rule.creador_rol, rule.creador_id])
           const eventId = created.rows[0]?.id_curso_agendado
           if (eventId) await enrollSeriesMembers(client, Number(rule.id_horario_recurrente), Number(eventId), date, limit)
           inserted += 1
@@ -292,6 +316,9 @@ const eventSelect = `
          ca.activo,
          ca.id_horario_recurrente,
          ca.modificado_manualmente,
+         ca.estado_instructor,
+         ca.creador_rol,
+         ca.creador_id,
          c.nombre AS curso_nombre,
          c.tema AS curso_tema,
          c.descripcion AS curso_descripcion,
@@ -329,11 +356,13 @@ type EventRow = Record<string, unknown> & {
   participantes_instructores: number
   mi_rol: string | null
   mi_serie: boolean
+  creador_rol: string | null
+  creador_id: string | null
 }
 
 // Los alumnos solo ven el número de asistentes si el administrador lo permite, pero siempre saben si está completo.
 function presentEvent(row: EventRow, viewer: CalendarViewer) {
-  const { participantes_alumnos: students, participantes_instructores: instructors, mi_rol: myRole, mi_serie: mySeries, ...event } = row
+  const { participantes_alumnos: students, participantes_instructores: instructors, mi_rol: myRole, mi_serie: mySeries, creador_rol: creatorRole, creador_id: creatorId, ...event } = row
   const limit = row.limite_participantes === null ? null : Number(row.limite_participantes)
   const countVisible = row.mostrar_asistentes || viewer.role !== 'USER'
   return {
@@ -342,6 +371,7 @@ function presentEvent(row: EventRow, viewer: CalendarViewer) {
     asistentes: countVisible ? { alumnos: Number(students), instructores: Number(instructors) } : null,
     completo: limit !== null && Number(students) >= limit,
     mi_participacion: myRole ? { rol: myRole, serie: Boolean(mySeries) } : null,
+    puede_modificar: ownsRecord(creatorRole, creatorId, viewer),
   }
 }
 
@@ -352,8 +382,14 @@ export async function listCalendarEvents(pool: Pool, from: string, to: string, r
   const result = await pool.query<EventRow>(`${eventSelect}
     WHERE ca.fecha_hora < $2::timestamp AND ca.fecha_hora_fin > $1::timestamp
       AND ($3::bigint IS NULL OR ca.id_sala = $3)
+      AND (
+        ca.estado_instructor = 'ACEPTADO'
+        OR $5::text = 'ADMIN'
+        OR (ca.creador_rol = $5::text AND ca.creador_id = $6::bigint)
+        OR ca.id_instructor = $7::bigint
+      )
     ORDER BY ca.fecha_hora, ca.id_curso_agendado
-  `, [range.fromTimestamp, range.toTimestamp, roomId ?? null, viewer.studentId])
+  `, [range.fromTimestamp, range.toTimestamp, roomId ?? null, viewer.studentId, viewer.role, viewer.userId, viewer.instructorId])
   return result.rows.map((row) => presentEvent(row, viewer))
 }
 
@@ -486,7 +522,7 @@ export async function materializeUpcomingOccurrences(pool: Pool, days = material
   return ensureCalendarOccurrences(pool, today, addDays(today, days + 1))
 }
 
-export async function createCalendarEvent(pool: Pool, input: CalendarEventInput) {
+export async function createCalendarEvent(pool: Pool, input: CalendarEventInput, creator: CalendarActor) {
   const { start, end } = validateEventInterval(input.startAt, input.endAt)
   return inTransaction(pool, async (client) => {
     await client.query('SELECT pg_advisory_xact_lock($1)', [scheduleLock])
@@ -494,13 +530,17 @@ export async function createCalendarEvent(pool: Pool, input: CalendarEventInput)
     await assertCourseAndInstructor(client, input.courseId, input.instructorId)
     await assertActiveRoom(client, input.roomId)
     await assertAvailable(client, input.roomId, start, end)
+    // Un instructor que se asigna a sí mismo no necesita confirmar su propia solicitud.
+    const selfAssigned = creator.role === 'INSTRUCTOR' && creator.instructorId === input.instructorId
     const result = await client.query<{ id_curso_agendado: number }>(`
       INSERT INTO cursos_agendados
-        (id_curso, id_instructor, id_sala, fecha_hora, fecha_hora_fin, activo, limite_participantes, mostrar_asistentes, descripcion)
-      VALUES ($1, $2, $3, $4::timestamp, $5::timestamp, TRUE, $6, $7, $8)
+        (id_curso, id_instructor, id_sala, fecha_hora, fecha_hora_fin, activo, limite_participantes, mostrar_asistentes,
+         descripcion, creador_rol, creador_id, estado_instructor)
+      VALUES ($1, $2, $3, $4::timestamp, $5::timestamp, TRUE, $6, $7, $8, $9, $10, $11)
       RETURNING id_curso_agendado
     `, [input.courseId, input.instructorId, input.roomId, start, end,
-      input.participantLimit ?? null, input.showAttendeeCount ?? true, input.description?.trim() || null])
+      input.participantLimit ?? null, input.showAttendeeCount ?? true, input.description?.trim() || null,
+      creator.role, creator.userId, selfAssigned ? 'ACEPTADO' : 'PENDIENTE'])
     return result.rows[0]
   })
 }
@@ -517,7 +557,7 @@ async function assertLimitFitsEvent(client: PoolClient, eventId: number, limit: 
   }
 }
 
-export async function updateCalendarEvent(pool: Pool, id: number, input: CalendarEventPatch) {
+export async function updateCalendarEvent(pool: Pool, id: number, input: CalendarEventPatch, actor: CalendarActor) {
   return inTransaction(pool, async (client) => {
     await client.query('SELECT pg_advisory_xact_lock($1)', [scheduleLock])
     const existing = await client.query<{
@@ -528,15 +568,18 @@ export async function updateCalendarEvent(pool: Pool, id: number, input: Calenda
       fecha_hora_fin: string
       id_horario_recurrente: number | null
       fecha_recurrencia: string | null
+      creador_rol: string | null
+      creador_id: string | null
     }>(`
       SELECT id_curso, id_instructor, id_sala,
              to_char(fecha_hora, 'YYYY-MM-DD"T"HH24:MI:SS') AS fecha_hora,
              to_char(fecha_hora_fin, 'YYYY-MM-DD"T"HH24:MI:SS') AS fecha_hora_fin,
-             id_horario_recurrente, fecha_recurrencia::text
+             id_horario_recurrente, fecha_recurrencia::text, creador_rol, creador_id::text
       FROM cursos_agendados WHERE id_curso_agendado = $1 AND activo = TRUE
     `, [id])
     const old = existing.rows[0]
     if (!old) throw new ApiError(404, 'No se encontró una actividad activa con ese identificador.')
+    assertCanModify(old, actor)
 
     const courseId = input.courseId ?? Number(old.id_curso)
     const instructorId = input.instructorId ?? Number(old.id_instructor)
@@ -556,6 +599,19 @@ export async function updateCalendarEvent(pool: Pool, id: number, input: Calenda
       || interval.start !== normalizeLocalDateTime(old.fecha_hora)
       || interval.end !== normalizeLocalDateTime(old.fecha_hora_fin)
 
+    // Cambiar de instructor abre una solicitud nueva, salvo que el actor se asigne a sí mismo.
+    let nextState: 'PENDIENTE' | 'ACEPTADO' | null = null
+    if (instructorId !== Number(old.id_instructor)) {
+      nextState = actor.role === 'INSTRUCTOR' && actor.instructorId === instructorId ? 'ACEPTADO' : 'PENDIENTE'
+      if (nextState === 'PENDIENTE') {
+        const enrolled = await client.query(
+          "SELECT 1 FROM participaciones_evento WHERE id_curso_agendado = $1 AND rol = 'ALUMNO' LIMIT 1",
+          [id],
+        )
+        if (enrolled.rows[0]) throw new ApiError(409, 'Hay alumnos apuntados; cancela la actividad antes de cambiar de instructor.')
+      }
+    }
+
     const result = await client.query(`
       UPDATE cursos_agendados
       SET id_curso = $2, id_instructor = $3, id_sala = $4,
@@ -567,12 +623,13 @@ export async function updateCalendarEvent(pool: Pool, id: number, input: Calenda
           END,
           limite_participantes = CASE WHEN $8 THEN $9::int ELSE limite_participantes END,
           mostrar_asistentes = COALESCE($10, mostrar_asistentes),
-          descripcion = CASE WHEN $11 THEN $12::text ELSE descripcion END
+          descripcion = CASE WHEN $11 THEN $12::text ELSE descripcion END,
+          estado_instructor = COALESCE($13::text, estado_instructor)
       WHERE id_curso_agendado = $1
       RETURNING id_curso_agendado
     `, [id, courseId, instructorId, roomId, interval.start, interval.end, scheduleChanged,
       input.participantLimit !== undefined, input.participantLimit ?? null, input.showAttendeeCount ?? null,
-      input.description !== undefined, input.description?.trim() || null])
+      input.description !== undefined, input.description?.trim() || null, nextState])
     return result.rows[0]
   })
 }
@@ -647,9 +704,15 @@ export async function acknowledgeCancellationNotice(pool: Pool, noticeId: number
   return { acknowledged: true }
 }
 
-export async function cancelCalendarEvent(pool: Pool, id: number) {
+export async function cancelCalendarEvent(pool: Pool, id: number, actor: CalendarActor) {
   return inTransaction(pool, async (client) => {
     await client.query('SELECT pg_advisory_xact_lock($1)', [scheduleLock])
+    const owner = await client.query<{ creador_rol: string | null; creador_id: string | null }>(`
+      SELECT creador_rol, creador_id::text FROM cursos_agendados
+      WHERE id_curso_agendado = $1 AND activo = TRUE FOR UPDATE
+    `, [id])
+    if (!owner.rows[0]) throw new ApiError(404, 'No se encontró una actividad activa con ese identificador.')
+    assertCanModify(owner.rows[0], actor)
     const result = await client.query(`
       UPDATE cursos_agendados SET activo = FALSE
       WHERE id_curso_agendado = $1 AND activo = TRUE
@@ -661,7 +724,98 @@ export async function cancelCalendarEvent(pool: Pool, id: number) {
   })
 }
 
-export async function createRecurringRules(pool: Pool, input: RecurrenceInput) {
+export async function respondToEventRequest(
+  pool: Pool,
+  eventId: number,
+  instructorId: number | null,
+  decision: 'ACEPTADO' | 'RECHAZADO',
+) {
+  if (instructorId === null) throw new ApiError(403, 'Solo el instructor asignado puede responder a esta solicitud.')
+  return inTransaction(pool, async (client) => {
+    await client.query('SELECT pg_advisory_xact_lock($1)', [scheduleLock])
+    const found = await client.query<{
+      creador_rol: 'ADMIN' | 'INSTRUCTOR' | null
+      creador_id: string | null
+      curso_nombre: string
+      instructor_nombre: string
+      sala_nombre: string | null
+      fecha_hora: string
+      fecha_hora_fin: string
+    }>(`
+      SELECT ca.creador_rol, ca.creador_id::text, c.nombre AS curso_nombre, i.nombre AS instructor_nombre,
+             s.nombre AS sala_nombre,
+             to_char(ca.fecha_hora, 'YYYY-MM-DD"T"HH24:MI:SS') AS fecha_hora,
+             to_char(ca.fecha_hora_fin, 'YYYY-MM-DD"T"HH24:MI:SS') AS fecha_hora_fin
+      FROM cursos_agendados ca
+      JOIN cursos c ON c.id_curso = ca.id_curso
+      JOIN instructores i ON i.id_instructor = ca.id_instructor
+      LEFT JOIN salas s ON s.id_sala = ca.id_sala
+      WHERE ca.id_curso_agendado = $1 AND ca.id_instructor = $2
+        AND ca.estado_instructor = 'PENDIENTE' AND ca.activo = TRUE
+      FOR UPDATE OF ca
+    `, [eventId, instructorId])
+    const event = found.rows[0]
+    if (!event) throw new ApiError(404, 'No tienes una solicitud pendiente para esta actividad.')
+
+    if (event.creador_rol && event.creador_id !== null) {
+      await client.query(`
+        INSERT INTO avisos_respuesta_evento
+          (destinatario_rol, destinatario_id, decision, curso_nombre, instructor_nombre, sala_nombre, fecha_hora, fecha_hora_fin)
+        VALUES ($1, $2, $3, $4, $5, $6, $7::timestamp, $8::timestamp)
+      `, [event.creador_rol, event.creador_id, decision, event.curso_nombre, event.instructor_nombre,
+        event.sala_nombre, event.fecha_hora, event.fecha_hora_fin])
+    }
+    if (decision === 'ACEPTADO') {
+      await client.query("UPDATE cursos_agendados SET estado_instructor = 'ACEPTADO' WHERE id_curso_agendado = $1", [eventId])
+    } else {
+      await client.query('DELETE FROM cursos_agendados WHERE id_curso_agendado = $1', [eventId])
+    }
+    return { id_curso_agendado: eventId, decision }
+  })
+}
+
+export async function listEventRequestNotifications(
+  pool: Pool,
+  user: { role: string; userId: number; instructorId: number | null },
+) {
+  const requests = user.instructorId === null ? [] : (await pool.query(`
+    SELECT ca.id_curso_agendado, c.nombre AS curso_nombre,
+           to_char(ca.fecha_hora, 'YYYY-MM-DD"T"HH24:MI:SS') AS fecha_hora,
+           to_char(ca.fecha_hora_fin, 'YYYY-MM-DD"T"HH24:MI:SS') AS fecha_hora_fin,
+           s.nombre AS sala_nombre, ca.descripcion,
+           COALESCE(adm.nombre, org.nombre) AS organizador_nombre
+    FROM cursos_agendados ca
+    JOIN cursos c ON c.id_curso = ca.id_curso
+    LEFT JOIN salas s ON s.id_sala = ca.id_sala
+    LEFT JOIN administradores adm ON ca.creador_rol = 'ADMIN' AND adm.id_administrador = ca.creador_id
+    LEFT JOIN alumnos org ON ca.creador_rol = 'INSTRUCTOR' AND org.id_alumno = ca.creador_id
+    WHERE ca.id_instructor = $1 AND ca.estado_instructor = 'PENDIENTE' AND ca.activo = TRUE
+      AND ca.fecha_hora_fin > (CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Madrid')
+    ORDER BY ca.fecha_hora, ca.id_curso_agendado
+  `, [user.instructorId])).rows
+  const responses = user.role === 'ADMIN' || user.role === 'INSTRUCTOR' ? (await pool.query(`
+    SELECT id_aviso, decision, curso_nombre, instructor_nombre, sala_nombre,
+           to_char(fecha_hora, 'YYYY-MM-DD"T"HH24:MI:SS') AS fecha_hora,
+           to_char(fecha_hora_fin, 'YYYY-MM-DD"T"HH24:MI:SS') AS fecha_hora_fin
+    FROM avisos_respuesta_evento
+    WHERE destinatario_rol = $1 AND destinatario_id = $2 AND fecha_confirmacion IS NULL
+    ORDER BY fecha_creacion DESC, id_aviso DESC
+  `, [user.role, user.userId])).rows : []
+  return { requests, responses }
+}
+
+export async function acknowledgeEventResponse(pool: Pool, noticeId: number, actor: CalendarActor) {
+  const result = await pool.query(`
+    UPDATE avisos_respuesta_evento
+    SET fecha_confirmacion = COALESCE(fecha_confirmacion, CURRENT_TIMESTAMP)
+    WHERE id_aviso = $1 AND destinatario_rol = $2 AND destinatario_id = $3
+    RETURNING id_aviso
+  `, [noticeId, actor.role, actor.userId])
+  if (!result.rows[0]) throw new ApiError(404, 'No se encontró el aviso.')
+  return { acknowledged: true }
+}
+
+export async function createRecurringRules(pool: Pool, input: RecurrenceInput, creator: CalendarActor) {
   const startTime = normalizeTime(input.startTime)
   const endTime = normalizeTime(input.endTime)
   if (endTime <= startTime) throw new ApiError(400, 'La hora de fin debe ser posterior a la hora de inicio.')
@@ -686,11 +840,11 @@ export async function createRecurringRules(pool: Pool, input: RecurrenceInput) {
       const result = await client.query<{ id_horario_recurrente: number }>(`
         INSERT INTO horarios_recurrentes
           (id_curso, id_instructor, id_sala, dia_semana, hora_inicio, hora_fin, fecha_inicio, fecha_fin, activo,
-           limite_participantes, mostrar_asistentes)
-        VALUES ($1, $2, $3, $4, $5::time, $6::time, $7::date, $8::date, TRUE, $9, $10)
+           limite_participantes, mostrar_asistentes, creador_rol, creador_id)
+        VALUES ($1, $2, $3, $4, $5::time, $6::time, $7::date, $8::date, TRUE, $9, $10, $11, $12)
         RETURNING id_horario_recurrente
       `, [input.courseId, input.instructorId, input.roomId, weekday, startTime, endTime, input.startsOn, input.endsOn,
-        input.participantLimit ?? null, input.showAttendeeCount ?? true])
+        input.participantLimit ?? null, input.showAttendeeCount ?? true, creator.role, creator.userId])
       created.push(result.rows[0])
     }
 
@@ -702,17 +856,18 @@ export async function createRecurringRules(pool: Pool, input: RecurrenceInput) {
   })
 }
 
-export async function updateRecurringRule(pool: Pool, id: number, input: RecurrencePatch) {
+export async function updateRecurringRule(pool: Pool, id: number, input: RecurrencePatch, actor: CalendarActor) {
   return inTransaction(pool, async (client) => {
     await client.query('SELECT pg_advisory_xact_lock($1)', [scheduleLock])
     const query = await client.query<RecurrenceRow>(`
       SELECT id_horario_recurrente, id_curso, id_instructor, id_sala, dia_semana,
              hora_inicio::text, hora_fin::text, fecha_inicio::text, fecha_fin::text,
-             limite_participantes, mostrar_asistentes
+             limite_participantes, mostrar_asistentes, creador_rol, creador_id::text
       FROM horarios_recurrentes WHERE id_horario_recurrente = $1 AND activo = TRUE
     `, [id])
     const old = query.rows[0]
     if (!old) throw new ApiError(404, 'No se encontró un horario recurrente activo.')
+    assertCanModify(old, actor)
 
     const courseId = input.courseId ?? Number(old.id_curso)
     const instructorId = input.instructorId ?? Number(old.id_instructor)
@@ -809,9 +964,15 @@ export async function updateRecurringRule(pool: Pool, id: number, input: Recurre
   })
 }
 
-export async function cancelRecurringRule(pool: Pool, id: number) {
+export async function cancelRecurringRule(pool: Pool, id: number, actor: CalendarActor) {
   return inTransaction(pool, async (client) => {
     await client.query('SELECT pg_advisory_xact_lock($1)', [scheduleLock])
+    const owner = await client.query<{ creador_rol: string | null; creador_id: string | null }>(
+      'SELECT creador_rol, creador_id::text FROM horarios_recurrentes WHERE id_horario_recurrente = $1 AND activo = TRUE FOR UPDATE',
+      [id],
+    )
+    if (!owner.rows[0]) throw new ApiError(404, 'No se encontró un horario recurrente activo.')
+    assertCanModify(owner.rows[0], actor)
     const result = await client.query(`
       UPDATE horarios_recurrentes SET activo = FALSE
       WHERE id_horario_recurrente = $1 AND activo = TRUE
@@ -829,19 +990,23 @@ export async function cancelRecurringRule(pool: Pool, id: number) {
   })
 }
 
-export async function listRecurringRules(pool: Pool) {
+export async function listRecurringRules(pool: Pool, actor: CalendarActor) {
   const result = await pool.query(`
     SELECT hr.id_horario_recurrente, hr.id_curso, c.nombre AS curso_nombre,
            c.tipo_curso, hr.id_instructor, i.nombre AS instructor_nombre,
            hr.id_sala, s.nombre AS sala_nombre,
            hr.dia_semana, hr.hora_inicio::text, hr.hora_fin::text,
            hr.fecha_inicio::text, hr.fecha_fin::text, hr.activo,
-           hr.limite_participantes, hr.mostrar_asistentes
+           hr.limite_participantes, hr.mostrar_asistentes,
+           hr.creador_rol, hr.creador_id::text AS creador_id
     FROM horarios_recurrentes hr
     JOIN cursos c ON c.id_curso = hr.id_curso
     JOIN instructores i ON i.id_instructor = hr.id_instructor
     LEFT JOIN salas s ON s.id_sala = hr.id_sala
     ORDER BY hr.dia_semana, hr.hora_inicio
   `)
-  return result.rows
+  return result.rows.map(({ creador_rol: creatorRole, creador_id: creatorId, ...rule }) => ({
+    ...rule,
+    puede_modificar: ownsRecord(creatorRole, creatorId, actor),
+  }))
 }

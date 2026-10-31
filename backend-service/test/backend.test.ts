@@ -120,17 +120,32 @@ async function seedAccountsAndCourses() {
 }
 
 let latestAdminCookie: string | undefined
+let loginCounter = 0
+const sessionCookies = new Map<string, string>()
 
 async function login(email: string, password = 'test-password-123') {
   if (!app) throw new Error('Test server has not been initialized.')
+  // El límite de intentos es por IP y cuenta; cada login usa una IP distinta para no agotarlo.
+  const n = ++loginCounter
   const response = await app.inject({
     method: 'POST',
     url: '/api/auth/login',
+    headers: { 'x-forwarded-for': `10.0.${(n >> 8) & 255}.${n & 255}` },
     payload: { email, password },
   })
   const cookie = response.headers['set-cookie']?.toString().split(';')[0]
+  if (cookie && response.statusCode === 200) sessionCookies.set(email, cookie)
   if (email === 'admin@test.invalid' && response.statusCode === 200) latestAdminCookie = cookie
   return { response, cookie }
+}
+
+// El límite de intentos de login es por cuenta; se reutiliza la sesión ya abierta.
+async function sessionCookie(email: string) {
+  const existing = sessionCookies.get(email)
+  if (existing) return existing
+  const { cookie } = await login(email)
+  if (!cookie) throw new Error(`No se pudo iniciar sesión con ${email}.`)
+  return cookie
 }
 
 function authHeaders(cookie: string | undefined) {
@@ -513,7 +528,7 @@ describe('auth and backwards-compatible database API', () => {
       method: 'POST',
       url: '/api/database/tables/administradores/rows',
       headers: authHeaders(cookie),
-      payload: { nombre: 'Segundo admin', correo_electronico: 'admin2@test.invalid', password_hash: 'another-test-password' },
+      payload: { nombre: 'Segundo admin', fecha_inicio: '2092-10-01', correo_electronico: 'admin2@test.invalid', password_hash: 'another-test-password' },
     })
     expect(secondAdmin.statusCode).toBe(200)
     expect(secondAdmin.json()).not.toHaveProperty('password_hash')
@@ -1378,6 +1393,140 @@ describe('agenda API', () => {
     ]))
   })
 
+  it('asks the assigned instructor to accept an event and tells the creator the answer', async () => {
+    const adminCookie = await sessionCookie('admin@test.invalid')
+    const titularCookie = await sessionCookie('instructor@test.invalid')
+    const otherInstructorCookie = await sessionCookie('instructor2@test.invalid')
+    const studentCookie = await sessionCookie('student@test.invalid')
+    const day = '2097-03-01'
+    const create = (cookie: string, instructorId: number, from: string, to: string) => app.inject({
+      method: 'POST',
+      url: '/api/calendar/events',
+      headers: authHeaders(cookie),
+      payload: { courseId: ids.specialCourse, instructorId, roomId: ids.primaryRoom, startAt: `${day}T${from}`, endAt: `${day}T${to}` },
+    })
+    const list = async (cookie: string) => (await app.inject({
+      url: `/api/calendar/events?from=${day}T00:00&to=2097-03-02T00:00`,
+      headers: authHeaders(cookie),
+    })).json() as Array<{ id_curso_agendado: string; estado_instructor: string; puede_modificar: boolean }>
+    const notices = async (cookie: string) => (await app.inject({
+      url: '/api/calendar/event-notifications',
+      headers: authHeaders(cookie),
+    })).json() as { requests: Array<{ id_curso_agendado: string }>; responses: Array<{ id_aviso: string; decision: string; curso_nombre: string }> }
+    const respond = (cookie: string, eventId: number, decision: string) => app.inject({
+      method: 'POST',
+      url: `/api/calendar/event-requests/${eventId}/respond`,
+      headers: authHeaders(cookie),
+      payload: { decision },
+    })
+    const has = (events: Array<{ id_curso_agendado: string }>, eventId: number) => events.some((event) => Number(event.id_curso_agendado) === eventId)
+
+    const created = await create(adminCookie, ids.instructor, '10:00', '11:00')
+    expect(created.statusCode).toBe(201)
+    const eventId = Number(created.json().id_curso_agendado)
+
+    // Pendiente: solo lo ven el administrador creador y el instructor asignado.
+    expect(has(await list(studentCookie), eventId)).toBe(false)
+    expect(has(await list(otherInstructorCookie), eventId)).toBe(false)
+    expect(has(await list(titularCookie), eventId)).toBe(true)
+    expect((await list(adminCookie)).find((event) => Number(event.id_curso_agendado) === eventId))
+      .toMatchObject({ estado_instructor: 'PENDIENTE', puede_modificar: true })
+    expect((await app.inject({
+      method: 'POST', url: `/api/calendar/events/${eventId}/participation`, headers: authHeaders(studentCookie), payload: {},
+    })).statusCode).toBe(404)
+    expect(has((await notices(titularCookie)).requests, eventId)).toBe(true)
+    expect(has((await notices(otherInstructorCookie)).requests, eventId)).toBe(false)
+    expect((await respond(otherInstructorCookie, eventId, 'ACEPTADO')).statusCode).toBe(404)
+    expect((await respond(studentCookie, eventId, 'ACEPTADO')).statusCode).toBe(403)
+
+    expect((await respond(titularCookie, eventId, 'ACEPTADO')).statusCode).toBe(200)
+    expect(has((await notices(titularCookie)).requests, eventId)).toBe(false)
+    expect((await list(studentCookie)).find((event) => Number(event.id_curso_agendado) === eventId))
+      .toMatchObject({ estado_instructor: 'ACEPTADO', puede_modificar: false })
+    expect((await app.inject({
+      method: 'POST', url: `/api/calendar/events/${eventId}/participation`, headers: authHeaders(studentCookie), payload: {},
+    })).statusCode).toBe(200)
+
+    // El organizador recibe un aviso con la respuesta hasta que lo confirma.
+    const accepted = (await notices(adminCookie)).responses.filter((notice) => notice.decision === 'ACEPTADO')
+    expect(accepted).toEqual([expect.objectContaining({ curso_nombre: 'Curso especial test' })])
+    expect((await notices(titularCookie)).responses).toEqual([])
+    expect((await app.inject({
+      method: 'POST', url: `/api/calendar/event-notifications/${accepted[0]!.id_aviso}/acknowledge`, headers: authHeaders(titularCookie),
+    })).statusCode).toBe(404)
+    expect((await app.inject({
+      method: 'POST', url: `/api/calendar/event-notifications/${accepted[0]!.id_aviso}/acknowledge`, headers: authHeaders(adminCookie),
+    })).statusCode).toBe(200)
+    expect((await notices(adminCookie)).responses).toEqual([])
+
+    // Solo el administrador y el creador modifican el evento.
+    const edit = (cookie: string) => app.inject({
+      method: 'PATCH', url: `/api/calendar/events/${eventId}`, headers: authHeaders(cookie), payload: { description: 'Cambio' },
+    })
+    expect((await edit(titularCookie)).statusCode).toBe(403)
+    expect((await edit(otherInstructorCookie)).statusCode).toBe(403)
+    expect((await app.inject({
+      method: 'POST', url: `/api/calendar/events/${eventId}/cancel`, headers: authHeaders(titularCookie),
+    })).statusCode).toBe(403)
+    expect((await edit(adminCookie)).statusCode).toBe(200)
+    // Con alumnos apuntados no se puede cambiar de instructor: la nueva solicitud ocultaría la actividad.
+    expect((await app.inject({
+      method: 'PATCH', url: `/api/calendar/events/${eventId}`, headers: authHeaders(adminCookie), payload: { instructorId: ids.secondInstructor },
+    })).statusCode).toBe(409)
+
+    // Rechazo: el creador (un instructor) recibe el aviso y el evento desaparece.
+    const rejectedEvent = await create(otherInstructorCookie, ids.instructor, '12:00', '13:00')
+    expect(rejectedEvent.statusCode).toBe(201)
+    const rejectedId = Number(rejectedEvent.json().id_curso_agendado)
+    expect(has(await list(otherInstructorCookie), rejectedId)).toBe(true)
+    expect((await respond(titularCookie, rejectedId, 'RECHAZADO')).statusCode).toBe(200)
+    expect((await pool.query('SELECT 1 FROM cursos_agendados WHERE id_curso_agendado = $1', [rejectedId])).rows).toHaveLength(0)
+    expect(has(await list(otherInstructorCookie), rejectedId)).toBe(false)
+    const creatorNotices = (await notices(otherInstructorCookie)).responses
+    expect(creatorNotices).toEqual([expect.objectContaining({ decision: 'RECHAZADO', curso_nombre: 'Curso especial test' })])
+    expect((await notices(adminCookie)).responses).toEqual([])
+    expect((await respond(titularCookie, rejectedId, 'ACEPTADO')).statusCode).toBe(404)
+    expect((await app.inject({
+      method: 'POST', url: `/api/calendar/event-notifications/${creatorNotices[0]!.id_aviso}/acknowledge`, headers: authHeaders(otherInstructorCookie),
+    })).statusCode).toBe(200)
+
+    // Un instructor que se asigna a sí mismo no necesita confirmar.
+    const selfAssigned = await create(titularCookie, ids.instructor, '14:00', '15:00')
+    expect(selfAssigned.statusCode).toBe(201)
+    expect((await list(studentCookie)).find((event) => Number(event.id_curso_agendado) === Number(selfAssigned.json().id_curso_agendado)))
+      .toMatchObject({ estado_instructor: 'ACEPTADO', puede_modificar: false })
+    expect(has((await notices(titularCookie)).requests, Number(selfAssigned.json().id_curso_agendado))).toBe(false)
+
+    // Cambiar el instructor de una actividad sin alumnos abre una solicitud nueva.
+    const pending = await create(adminCookie, ids.instructor, '16:00', '17:00')
+    const pendingId = Number(pending.json().id_curso_agendado)
+    expect((await app.inject({
+      method: 'PATCH', url: `/api/calendar/events/${pendingId}`, headers: authHeaders(adminCookie), payload: { instructorId: ids.secondInstructor },
+    })).statusCode).toBe(200)
+    expect(has((await notices(otherInstructorCookie)).requests, pendingId)).toBe(true)
+    expect(has((await notices(titularCookie)).requests, pendingId)).toBe(false)
+
+    // Los horarios habituales siguen la misma regla de creador.
+    const rule = await app.inject({
+      method: 'POST', url: '/api/calendar/recurring-rules', headers: authHeaders(titularCookie),
+      payload: {
+        courseId: ids.habitualCourse, instructorId: ids.instructor, roomId: ids.secondRoom,
+        weekdays: [2], startTime: '08:00', endTime: '09:00', startsOn: '2097-05-01', endsOn: '2097-05-31',
+      },
+    })
+    expect(rule.statusCode).toBe(201)
+    const ruleId = Number(rule.json().rules[0].id_horario_recurrente)
+    expect((await app.inject({
+      method: 'PATCH', url: `/api/calendar/recurring-rules/${ruleId}`, headers: authHeaders(otherInstructorCookie), payload: { startTime: '08:30' },
+    })).statusCode).toBe(403)
+    expect((await app.inject({
+      method: 'POST', url: `/api/calendar/recurring-rules/${ruleId}/cancel`, headers: authHeaders(otherInstructorCookie),
+    })).statusCode).toBe(403)
+    expect((await app.inject({
+      method: 'POST', url: `/api/calendar/recurring-rules/${ruleId}/cancel`, headers: authHeaders(titularCookie),
+    })).statusCode).toBe(200)
+  })
+
   it('prevents overlapping events, allows adjacent events, and cancels without deleting', async () => {
     const { cookie } = await login('instructor@test.invalid')
     const first = await app.inject({
@@ -1676,6 +1825,10 @@ describe('agenda API', () => {
     })
     expect(created.statusCode).toBe(201)
     const eventId = Number(created.json().id_curso_agendado)
+    expect((await app.inject({
+      method: 'POST', url: `/api/calendar/event-requests/${eventId}/respond`,
+      headers: authHeaders(instructorCookie), payload: { decision: 'ACEPTADO' },
+    })).statusCode).toBe(200)
 
     expect((await join(aCookie, eventId, { scope: 'occurrence' })).statusCode).toBe(200)
     expect((await join(bCookie, eventId, { scope: 'occurrence' })).statusCode).toBe(409)
@@ -1744,7 +1897,7 @@ describe('agenda API', () => {
     expect((await join(bCookie, march[2].id_curso_agendado, { scope: 'occurrence' })).statusCode).toBe(200)
     const series = await join(aCookie, march[0].id_curso_agendado, { scope: 'series' })
     expect(series.statusCode).toBe(200)
-    expect(series.json().joined).toContain(march[1].id_curso_agendado)
+    expect(series.json().joined.map(Number)).toContain(Number(march[1].id_curso_agendado))
     expect(series.json().skipped).toEqual([march[2].fecha_hora.slice(0, 10)])
     expect((await leave(aCookie, march[1].id_curso_agendado, 'occurrence')).statusCode).toBe(200)
 
@@ -2049,7 +2202,7 @@ describe('database migration runner', () => {
       await legacyPool.query('INSERT INTO flyway_schema_history (installed_rank, version, success) VALUES (12, $1, TRUE)', ['12'])
 
       const result = await migrateDatabase(legacyPool)
-      expect(result.migrationsExecuted).toBe(15)
+      expect(result.migrationsExecuted).toBe(21)
       const converted = await legacyPool.query(`
         SELECT a.numero_matricula, a.correo_electronico, a.es_instructor, a.password_hash
         FROM instructores i JOIN alumnos a ON a.id_alumno = i.id_alumno

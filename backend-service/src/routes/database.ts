@@ -6,6 +6,7 @@ import { hashPassword, isBcryptHash, isEmailAvailable } from '../auth/auth-servi
 import { currentUser, requireRole, Roles, type SessionUser } from '../domain/auth.js'
 import { ApiError } from '../errors.js'
 import {
+  calendarActor,
   cancelCalendarEvent,
   cancelRecurringRule,
   createCalendarEvent,
@@ -233,7 +234,7 @@ async function assertUniqueEmail(pool: Pool, tableName: string, payload: Row) {
   if (!available) throw new ApiError(409, 'Ya existe una cuenta con ese correo electrónico.')
 }
 
-async function insertRow(pool: Pool, tableName: string, payload: Row) {
+async function insertRow(pool: Pool, tableName: string, payload: Row, user: SessionUser) {
   if (tableName === 'administradores') {
     if (typeof payload.password_hash !== 'string' || !payload.password_hash.trim()) {
       throw new ApiError(400, 'Indica una contraseña para la cuenta ADMIN.')
@@ -266,7 +267,7 @@ async function insertRow(pool: Pool, tableName: string, payload: Row) {
       startAt,
       endAt,
       description: payload.descripcion === undefined ? undefined : payload.descripcion === null ? null : String(payload.descripcion),
-    })
+    }, calendarActor(user))
     if (!inserted) throw new ApiError(500, 'No se pudo guardar la actividad.')
     const row = await pool.query<Row>('SELECT * FROM cursos_agendados WHERE id_curso_agendado = $1', [inserted.id_curso_agendado])
     return row.rows[0]
@@ -285,7 +286,7 @@ async function insertRow(pool: Pool, tableName: string, payload: Row) {
       endTime: String(payload.hora_fin ?? ''),
       startsOn: String(payload.fecha_inicio ?? ''),
       endsOn: payload.fecha_fin === undefined || payload.fecha_fin === null || payload.fecha_fin === '' ? null : String(payload.fecha_fin),
-    })
+    }, calendarActor(user))
     const ruleId = created.rules[0]?.id_horario_recurrente
     if (!ruleId) throw new ApiError(500, 'No se pudo guardar el horario habitual.')
     const row = await pool.query<Row>('SELECT * FROM horarios_recurrentes WHERE id_horario_recurrente = $1', [ruleId])
@@ -323,7 +324,7 @@ async function insertRow(pool: Pool, tableName: string, payload: Row) {
   return undefined
 }
 
-async function updateRow(pool: Pool, tableName: string, id: string, payload: Row) {
+async function updateRow(pool: Pool, tableName: string, id: string, payload: Row, user: SessionUser) {
   if (tableName === 'salas') {
     const columns = await tableColumns(pool, tableName)
     const data = await preparePayload(tableName, payload, columns)
@@ -346,7 +347,7 @@ async function updateRow(pool: Pool, tableName: string, id: string, payload: Row
     const row = existing.rows[0]
     if (!row) throw new ApiError(404, 'No se encontró el registro que se quería actualizar.')
     if (payload.activo === false || payload.activo === 'false') {
-      await cancelCalendarEvent(pool, Number(id))
+      await cancelCalendarEvent(pool, Number(id), calendarActor(user))
       return { ...row, activo: false }
     }
     if (row.activo === false && (payload.activo === true || payload.activo === 'true')) {
@@ -363,7 +364,7 @@ async function updateRow(pool: Pool, tableName: string, id: string, payload: Row
       ...(payload.descripcion === undefined
         ? {}
         : { description: payload.descripcion === null ? null : String(payload.descripcion) }),
-    })
+    }, calendarActor(user))
     const updated = await pool.query<Row>('SELECT * FROM cursos_agendados WHERE id_curso_agendado::text = $1', [id])
     return updated.rows[0]
   }
@@ -379,7 +380,7 @@ async function updateRow(pool: Pool, tableName: string, id: string, payload: Row
       ...(payload.fecha_inicio === undefined ? {} : { startsOn: String(payload.fecha_inicio) }),
       ...(payload.fecha_fin === undefined ? {} : { endsOn: payload.fecha_fin === null || payload.fecha_fin === '' ? null : String(payload.fecha_fin) }),
     }
-    await updateRecurringRule(pool, Number(id), patch)
+    await updateRecurringRule(pool, Number(id), patch, calendarActor(user))
     const row = await pool.query<Row>('SELECT * FROM horarios_recurrentes WHERE id_horario_recurrente = $1', [id])
     return row.rows[0]
   }
@@ -420,7 +421,7 @@ async function updateRow(pool: Pool, tableName: string, id: string, payload: Row
   return result.rows[0] ? withoutPasswordHash(result.rows[0]) : undefined
 }
 
-async function deleteRow(pool: Pool, tableName: string, id: string) {
+async function deleteRow(pool: Pool, tableName: string, id: string, user: SessionUser) {
   if (tableName === 'administradores') {
     const result = await pool.query<{ count: string }>('SELECT COUNT(*)::text AS count FROM administradores')
     if (Number(result.rows[0]?.count ?? 0) <= 1) {
@@ -434,12 +435,12 @@ async function deleteRow(pool: Pool, tableName: string, id: string) {
   }
 
   if (tableName === 'cursos_agendados') {
-    await cancelCalendarEvent(pool, Number(id))
+    await cancelCalendarEvent(pool, Number(id), calendarActor(user))
     return true
   }
 
   if (tableName === 'horarios_recurrentes') {
-    await cancelRecurringRule(pool, Number(id))
+    await cancelRecurringRule(pool, Number(id), calendarActor(user))
     return true
   }
 
@@ -647,7 +648,7 @@ export const databaseRoutes: FastifyPluginAsync<DatabaseRoutesOptions> = async (
     assertCanMutate(user, tableName, 'create')
     const data = request.body ?? {}
     if (tableName === 'asistencias_curso') assertOwnAttendance(user, data)
-    return insertRow(pool, tableName, data)
+    return insertRow(pool, tableName, data, user)
   })
 
   app.put<{ Params: { tableName: string; id: string }; Body: Row }>('/tables/:tableName/rows/:id', writeLimit, async (request) => {
@@ -657,7 +658,7 @@ export const databaseRoutes: FastifyPluginAsync<DatabaseRoutesOptions> = async (
     if (tableName === 'administradores') {
       throw new ApiError(403, 'Los administradores pueden crearse y borrarse, pero no editarse.')
     }
-    return updateRow(pool, tableName, id, request.body ?? {})
+    return updateRow(pool, tableName, id, request.body ?? {}, user)
   })
 
   app.delete<{ Params: { tableName: string; id: string } }>('/tables/:tableName/rows/:id', writeLimit, async (request) => {
@@ -673,7 +674,7 @@ export const databaseRoutes: FastifyPluginAsync<DatabaseRoutesOptions> = async (
       if (!existing.rows[0]) return { deleted: false }
       assertOwnAttendance(user, existing.rows[0])
     }
-    return { deleted: await deleteRow(pool, tableName, id) }
+    return { deleted: await deleteRow(pool, tableName, id, user) }
   })
 
 }

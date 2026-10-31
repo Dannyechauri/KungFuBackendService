@@ -19,19 +19,21 @@ type EventRow = {
   fecha_recurrencia: string | null
   limite_participantes: number | null
   futuro: boolean
+  estado_instructor: string
 }
 
 async function lockedFutureEvent(client: PoolClient, eventId: number) {
   await client.query('SELECT pg_advisory_xact_lock($1)', [scheduleLock])
   const result = await client.query<EventRow>(`
     SELECT id_curso_agendado, fecha_hora::text, id_horario_recurrente, fecha_recurrencia::text,
-           limite_participantes,
+           limite_participantes, estado_instructor,
            fecha_hora > (CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Madrid') AS futuro
     FROM cursos_agendados
     WHERE id_curso_agendado = $1 AND activo = TRUE
   `, [eventId])
   const event = result.rows[0]
   if (!event) throw new ApiError(404, 'No se encontró una actividad activa con ese identificador.')
+  if (event.estado_instructor !== 'ACEPTADO') throw new ApiError(404, 'No se encontró una actividad activa con ese identificador.')
   if (!event.futuro) throw new ApiError(409, 'La actividad ya ha empezado; no se puede cambiar la participación.')
   return event
 }
