@@ -1527,6 +1527,53 @@ describe('agenda API', () => {
     })).statusCode).toBe(200)
   })
 
+  it('lets only the administrator delete cancelled events', async () => {
+    const adminCookie = await sessionCookie('admin@test.invalid')
+    const instructorCookie = await sessionCookie('instructor@test.invalid')
+    const remove = (cookie: string, id: number) => app.inject({
+      method: 'DELETE', url: `/api/calendar/events/${id}`, headers: authHeaders(cookie),
+    })
+    const cancel = (id: number) => app.inject({
+      method: 'POST', url: `/api/calendar/events/${id}/cancel`, headers: authHeaders(adminCookie),
+    })
+    const exists = async (id: number) => (await pool.query('SELECT 1 FROM cursos_agendados WHERE id_curso_agendado = $1', [id])).rows.length === 1
+
+    const created = await app.inject({
+      method: 'POST', url: '/api/calendar/events', headers: authHeaders(adminCookie),
+      payload: { courseId: ids.specialCourse, instructorId: ids.instructor, roomId: ids.primaryRoom, startAt: '2097-08-01T10:00', endAt: '2097-08-01T11:00' },
+    })
+    const eventId = Number(created.json().id_curso_agendado)
+    expect((await remove(adminCookie, eventId)).statusCode).toBe(409)
+    expect((await cancel(eventId)).statusCode).toBe(200)
+    expect((await remove(instructorCookie, eventId)).statusCode).toBe(403)
+    expect(await exists(eventId)).toBe(true)
+    expect((await remove(adminCookie, eventId)).statusCode).toBe(200)
+    expect(await exists(eventId)).toBe(false)
+    expect((await remove(adminCookie, eventId)).statusCode).toBe(404)
+
+    // Una sesión de un horario activo se regeneraría, así que solo se borra cuando el horario ya está cancelado.
+    const rule = await app.inject({
+      method: 'POST', url: '/api/calendar/recurring-rules', headers: authHeaders(adminCookie),
+      payload: {
+        courseId: ids.habitualCourse, instructorId: ids.instructor, roomId: ids.secondRoom,
+        weekdays: [3], startTime: '08:00', endTime: '09:00', startsOn: '2097-09-01', endsOn: '2097-09-30',
+      },
+    })
+    const ruleId = Number(rule.json().rules[0].id_horario_recurrente)
+    const occurrences = (await app.inject({
+      url: '/api/calendar/events?from=2097-09-01T00:00&to=2097-09-30T23:59', headers: authHeaders(adminCookie),
+    })).json().filter((event: { id_horario_recurrente: string | null }) => Number(event.id_horario_recurrente) === ruleId)
+    const occurrenceId = Number(occurrences[0].id_curso_agendado)
+    expect((await cancel(occurrenceId)).statusCode).toBe(200)
+    expect((await remove(adminCookie, occurrenceId)).statusCode).toBe(409)
+    expect(await exists(occurrenceId)).toBe(true)
+    expect((await app.inject({
+      method: 'POST', url: `/api/calendar/recurring-rules/${ruleId}/cancel`, headers: authHeaders(adminCookie),
+    })).statusCode).toBe(200)
+    expect((await remove(adminCookie, occurrenceId)).statusCode).toBe(200)
+    expect(await exists(occurrenceId)).toBe(false)
+  })
+
   it('prevents overlapping events, allows adjacent events, and cancels without deleting', async () => {
     const { cookie } = await login('instructor@test.invalid')
     const first = await app.inject({

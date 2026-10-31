@@ -15,6 +15,7 @@ import {
   createCalendarEvent,
   createCalendarRoom,
   createRecurringRules,
+  deleteCancelledEvent,
   listCalendarCourses,
   listCalendarEvents,
   listCalendarRooms,
@@ -261,6 +262,12 @@ export const calendarRoutes: FastifyPluginAsync<CalendarRoutesOptions> = async (
     const user = requireUser(request)
     if (!mayManageSchedule(user.role)) throw new ApiError(403, 'Solo administradores e instructores pueden gestionar la agenda.')
     return cancelCalendarEvent(pool, parseId(request.params.id), calendarActor(user))
+  })
+
+  app.delete<{ Params: { id: string } }>('/events/:id', writeLimit, async (request) => {
+    const user = requireUser(request)
+    if (!mayManageSchoolData(user.role)) throw new ApiError(403, 'Solo el administrador puede eliminar actividades.')
+    return deleteCancelledEvent(pool, parseId(request.params.id))
   })
 
   app.get('/recurring-rules', readLimit, async (request) => {

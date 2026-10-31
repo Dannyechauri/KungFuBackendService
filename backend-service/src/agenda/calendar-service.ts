@@ -724,6 +724,28 @@ export async function cancelCalendarEvent(pool: Pool, id: number, actor: Calenda
   })
 }
 
+export async function deleteCancelledEvent(pool: Pool, id: number) {
+  return inTransaction(pool, async (client) => {
+    await client.query('SELECT pg_advisory_xact_lock($1)', [scheduleLock])
+    const found = await client.query<{ activo: boolean; id_horario_recurrente: number | null; regla_activa: boolean | null }>(`
+      SELECT ca.activo, ca.id_horario_recurrente, hr.activo AS regla_activa
+      FROM cursos_agendados ca
+      LEFT JOIN horarios_recurrentes hr ON hr.id_horario_recurrente = ca.id_horario_recurrente
+      WHERE ca.id_curso_agendado = $1
+      FOR UPDATE OF ca
+    `, [id])
+    const event = found.rows[0]
+    if (!event) throw new ApiError(404, 'No se encontró la actividad.')
+    if (event.activo) throw new ApiError(409, 'Solo se pueden eliminar actividades canceladas.')
+    // Una sesión borrada de un horario activo se volvería a generar como activa.
+    if (event.id_horario_recurrente !== null && event.regla_activa) {
+      throw new ApiError(409, 'Esta sesión pertenece a un horario habitual activo y se volvería a generar. Cancela el horario para poder eliminarla.')
+    }
+    await client.query('DELETE FROM cursos_agendados WHERE id_curso_agendado = $1', [id])
+    return { id_curso_agendado: id, deleted: true }
+  })
+}
+
 export async function respondToEventRequest(
   pool: Pool,
   eventId: number,
